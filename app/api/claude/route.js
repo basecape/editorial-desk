@@ -1,8 +1,8 @@
-// This route proxies requests to the Anthropic API.
-// Your API key stays on the server, never exposed to the browser.
+// Proxies requests to Anthropic's API with streaming.
+// Streaming keeps the connection alive past Vercel's 60s Hobby-tier limit,
+// since each SSE event resets the idle timer.
 
 export const runtime = 'edge';
-export const maxDuration = 300; // 5 minutes for long web-search calls
 
 export async function POST(req) {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -22,7 +22,9 @@ export async function POST(req) {
     );
   }
 
-  // Forward to Anthropic
+  // Force streaming so the connection stays alive during long web-search calls
+  body.stream = true;
+
   try {
     const upstream = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -34,11 +36,22 @@ export async function POST(req) {
       body: JSON.stringify(body),
     });
 
-    const text = await upstream.text();
-    return new Response(text, {
-      status: upstream.status,
+    if (!upstream.ok) {
+      const text = await upstream.text();
+      return new Response(text, {
+        status: upstream.status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Pipe the SSE stream straight through to the browser
+    return new Response(upstream.body, {
+      status: 200,
       headers: {
-        'Content-Type': upstream.headers.get('Content-Type') || 'application/json',
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
       },
     });
   } catch (e) {

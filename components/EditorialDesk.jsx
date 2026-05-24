@@ -101,12 +101,46 @@ async function callClaude(prompt, useWebSearch = true, maxTokens = 4000) {
     try { parsed = JSON.parse(errText).error?.message || errText; } catch {}
     throw new Error(`API ${res.status} ${res.statusText}: ${parsed.slice(0, 300)}`);
   }
-  const data = await res.json();
-  const text = data.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-  if (!text.trim()) {
-    throw new Error('Claude returned no text. Try again or disable web search.');
+
+  // Parse Server-Sent Events stream from Anthropic
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let accumulatedText = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+
+    for (const event of events) {
+      let dataStr = '';
+      for (const line of event.split('\n')) {
+        if (line.startsWith('data: ')) dataStr = line.slice(6);
+      }
+      if (!dataStr || dataStr === '[DONE]') continue;
+
+      try {
+        const parsed = JSON.parse(dataStr);
+        if (parsed.type === 'content_block_delta' && parsed.delta?.type === 'text_delta') {
+          accumulatedText += parsed.delta.text;
+        } else if (parsed.type === 'error') {
+          throw new Error(`Stream error: ${parsed.error?.message || 'unknown error mid-stream'}`);
+        }
+      } catch (e) {
+        if (typeof e?.message === 'string' && e.message.startsWith('Stream error')) throw e;
+        // Otherwise ignore — likely just a non-JSON event we don't care about
+      }
+    }
   }
-  return text;
+
+  if (!accumulatedText.trim()) {
+    throw new Error('Claude returned no text. Try again, reduce count, or disable web search.');
+  }
+  return accumulatedText;
 }
 
 function extractJsonArray(text) {
