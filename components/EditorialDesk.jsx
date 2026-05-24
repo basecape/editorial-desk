@@ -78,12 +78,12 @@ const timeAgo = (ts) => {
 
 async function callClaude(prompt, useWebSearch = true, maxTokens = 4000) {
   const body = {
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: maxTokens,
     messages: [{ role: 'user', content: prompt }]
   };
   if (useWebSearch) {
-    body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
+    body.tools = [{ type: 'web_search_20260209', name: 'web_search' }];
   }
   let res;
   try {
