@@ -7,7 +7,8 @@ import {
   Loader2, ChevronRight, ChevronDown, AlertCircle, Search,
   ArrowRight, Save, Download, MoreHorizontal, Sparkles,
   ExternalLink, FileCode, GraduationCap, Beaker, Wand2,
-  MessageSquare, Lightbulb, RotateCcw, Network, Globe
+  MessageSquare, Lightbulb, RotateCcw, Network, Globe,
+  Zap, Rocket, Eye
 } from 'lucide-react';
 
 // ============================================================================
@@ -41,6 +42,53 @@ const DEFAULT_PROMPTS = [
   { id: 'p3', name: 'Headline test', template: 'Generate 10 headline options for this article. Mix patterns. Under 65 chars each. Then pick top 3 with reasoning.\n\nArticle:\n{article}', vars: ['article'] },
   { id: 'p4', name: 'Localise', template: 'Rewrite this for SA readers — swap units, foods, stats, references. Flag anything that doesn\'t hold in SA context.\n\nDraft:\n{draft}', vars: ['draft'] },
 ];
+
+const CATEGORIES = [
+  { id: 'fitness', label: 'Fitness' },
+  { id: 'nutrition', label: 'Nutrition' },
+  { id: 'mental_health', label: 'Mental health' },
+  { id: 'health_guides', label: 'Health guides' },
+  { id: 'beauty', label: 'Beauty' },
+];
+
+const DEFAULT_CATEGORY_TRAINING = {
+  fitness: `FITNESS content rules:
+- Speak to a wide range of readers — not just gym-goers. Walking, dancing, running, home workouts all count.
+- Reference SA-relevant: parkrun, hiking trails (Table Mountain, Drakensberg), local sports clubs, the cost barrier of gym membership.
+- Cite SA Sports Medicine Association, ACSM (Am. College of Sports Medicine), or peer-reviewed exercise physiology where relevant.
+- Avoid body-shape language. Focus on capability, energy, longevity, function.
+- Always include safety notes for beginners, people over 50, or those with conditions.
+- No fad workouts or unproven protocols. Be sceptical of TikTok fitness trends.`,
+  nutrition: `NUTRITION content rules:
+- Reference locally-available foods first: pap, samp, beans, morogo, biltong, amasi, sweet potatoes, peanuts, eggs, tinned pilchards, butternut.
+- Cite SA-specific bodies: ADSA (Association for Dietetics in SA), HPCSA dietitians, NICUS (Nutrition Information Centre at Stellenbosch).
+- Acknowledge cost — "affordable protein swaps", not just imported quinoa.
+- Avoid moral language about food ("clean", "guilty", "cheat"). Use neutral descriptors.
+- Be specific with quantities (grams, ml, cups) but flexible — not everyone weighs food.
+- Reject fad diets. Detoxes, juice cleanses, extreme restriction = always pushed back on with evidence.`,
+  mental_health: `MENTAL HEALTH content rules:
+- Always include SADAG: 0800 567 567. Also Lifeline 0861 322 322 and Suicide Crisis Line 0800 567 567.
+- Never dramatise. No "battle with depression" language. Use "lives with" or "experiences".
+- Person-first: "a person with bipolar disorder", not "a bipolar".
+- Acknowledge SA-specific stressors: load-shedding fatigue, crime anxiety, job insecurity, generational trauma.
+- Be aware of cultural stigma — frame help-seeking as strength, not weakness.
+- Cite SA bodies: SASOP (SA Society of Psychiatrists), Psychological Society of SA, SADAG.
+- For severe topics (suicide, self-harm, eating disorders): keep methods vague, foreground help resources.`,
+  health_guides: `HEALTH GUIDES content rules:
+- Comprehensive but skimmable. Use clear H2 subheads matching what readers actually search.
+- Always reference SA healthcare context: medical aid vs public clinics, GP referrals, specialist costs.
+- Cite SA Dept of Health, NICD, SAMRC, HPCSA, Heart and Stroke Foundation SA, CANSA, Diabetes SA.
+- Note when something requires a doctor — public clinic or private — and roughly what tests cost.
+- For chronic conditions, acknowledge the load on SA's healthcare system honestly.
+- Include "when to see a doctor" box with specific red flags.`,
+  beauty: `BEAUTY content rules:
+- Be sceptical of marketing claims. If a product or ingredient is hyped, look for the actual evidence.
+- Reference SA climate realities: high UV, dry inland air, humid coast, hard water in many areas.
+- Acknowledge skin tone diversity — products that work for fair skin don't always suit deeper tones (and vice versa).
+- Reference dermatologists registered with HPCSA, SA Society of Dermatology.
+- Mention price points in Rands. Note which products are in Clicks/Dis-Chem vs imported specialty.
+- Avoid promoting unrealistic standards. Focus on skin/hair health, not "fixing" perceived flaws.`,
+};
 
 // ============================================================================
 // STORAGE
@@ -254,7 +302,8 @@ export default function EditorialDesk() {
   const [settings, setSettings] = useState({ instructions: DEFAULT_INSTRUCTIONS, style: DEFAULT_STYLE });
   const [trainingEvents, setTrainingEvents] = useState([]);
   const [sitePages, setSitePages] = useState([]);
-  const [seeds, setSeeds] = useState({ evergreen: '', news: '' });
+  const [categoryTraining, setCategoryTraining] = useState(DEFAULT_CATEGORY_TRAINING);
+  const [seeds, setSeeds] = useState({ evergreen: '', news: '', mythbusting: '' });
   const [loaded, setLoaded] = useState(false);
   const [modal, setModal] = useState(null);
   const [toast, setToast] = useState(null);
@@ -271,23 +320,34 @@ export default function EditorialDesk() {
   // Load from storage with migration
   useEffect(() => {
     (async () => {
-      const [t, d, l, p, s, te, sp] = await Promise.all([
+      const [t, d, l, p, s, te, sp, ct] = await Promise.all([
         storage.get('topics', []),
         storage.get('drafts', []),
         storage.get('library', []),
         storage.get('prompts', DEFAULT_PROMPTS),
         storage.get('settings', { instructions: DEFAULT_INSTRUCTIONS, style: DEFAULT_STYLE }),
         storage.get('training', []),
-        storage.get('sitePages', [])
+        storage.get('sitePages', []),
+        storage.get('categoryTraining', DEFAULT_CATEGORY_TRAINING)
       ]);
-      // Migrate: any item without type becomes evergreen
-      setTopics(t.map(x => ({ ...x, type: x.type || 'evergreen' })));
-      setDrafts(d.map(x => ({ ...x, type: x.type || 'evergreen' })));
-      setLibraryItems(l.map(x => ({ ...x, type: x.type || 'evergreen' })));
+      // Migrate: any item without type becomes evergreen; old categories → new
+      const migrateCategory = (cat) => {
+        if (!cat) return 'health_guides';
+        const c = String(cat).toLowerCase();
+        if (['fitness', 'nutrition', 'mental_health', 'health_guides', 'beauty'].includes(c)) return c;
+        if (c === 'wellness') return 'health_guides';
+        if (c === 'mens' || c === "men's") return 'health_guides';
+        if (c === 'womens' || c === "women's") return 'health_guides';
+        return 'health_guides';
+      };
+      setTopics(t.map(x => ({ ...x, type: x.type || 'evergreen', category: migrateCategory(x.category) })));
+      setDrafts(d.map(x => ({ ...x, type: x.type || 'evergreen', category: migrateCategory(x.category) })));
+      setLibraryItems(l.map(x => ({ ...x, type: x.type || 'evergreen', category: migrateCategory(x.category) })));
       setPrompts(p);
       setSettings(s);
       setTrainingEvents(te);
-      setSitePages(sp);
+      setSitePages(sp.map(x => ({ ...x, category: migrateCategory(x.category) })));
+      setCategoryTraining({ ...DEFAULT_CATEGORY_TRAINING, ...ct });
       setLoaded(true);
     })();
   }, []);
@@ -381,6 +441,21 @@ export default function EditorialDesk() {
     });
   };
 
+  // ---- deployed toggle (library items) ----
+  const toggleDeployed = (id) => {
+    setLibraryItems(prev => {
+      const next = prev.map(i => i.id === id ? { ...i, deployed: !i.deployed, deployedAt: !i.deployed ? Date.now() : null } : i);
+      storage.set('library', next);
+      return next;
+    });
+  };
+
+  // ---- category training save ----
+  const saveCategoryTraining = (next) => {
+    setCategoryTraining(next);
+    storage.set('categoryTraining', next);
+  };
+
   // ---- build sitemap context for topic generation ----
   const buildSitemapContext = () => {
     // Group everything by cluster
@@ -391,6 +466,7 @@ export default function EditorialDesk() {
       clusters[c].push({
         title: item.title,
         keyword: item.keyword || '',
+        url: item.url || '',
         status
       });
     };
@@ -398,7 +474,7 @@ export default function EditorialDesk() {
     topics.filter(t => t.status === 'pending' || t.status === 'writing' || t.status === 'written')
       .forEach(t => addToCluster(t, 'PLANNED'));
     drafts.forEach(d => addToCluster(d, 'DRAFT'));
-    libraryItems.forEach(l => addToCluster(l, 'READY'));
+    libraryItems.forEach(l => addToCluster(l, l.deployed ? 'DEPLOYED' : 'READY'));
 
     if (Object.keys(clusters).length === 0) return '';
 
@@ -414,6 +490,20 @@ export default function EditorialDesk() {
     return out;
   };
 
+  // Build a list of internal link targets for article generation (with URLs)
+  const buildLinkingContext = () => {
+    const targets = [];
+    sitePages.forEach(p => { if (p.url) targets.push({ title: p.title, url: p.url, keyword: p.keyword || '', cluster: p.cluster || '' }); });
+    libraryItems.forEach(l => { if (l.url) targets.push({ title: l.title, url: l.url, keyword: l.keyword || '', cluster: l.cluster || '' }); });
+    if (targets.length === 0) return '';
+    let out = 'INTERNAL LINK TARGETS — pages on this site you can link to from the article body:\n\n';
+    targets.forEach(t => {
+      out += `- "${t.title}" — ${t.url}${t.keyword ? ` (about: ${t.keyword})` : ''}${t.cluster ? ` [cluster: ${t.cluster}]` : ''}\n`;
+    });
+    out += '\nINTERNAL LINKING INSTRUCTIONS:\n- Where a sentence in your article naturally mentions a topic covered by one of the pages above, link to it using markdown: [anchor text](url)\n- Aim for 2–5 internal links per article. Quality over quantity.\n- Anchor text should be natural — descriptive phrases, NOT "click here" or the bare title.\n- Only link where it genuinely helps the reader continue learning. Do not stuff.\n- Never link to a page whose topic conflicts with what you are saying.';
+    return out;
+  };
+
   // ---- generate topics ----
   const generateTopics = async (type, seed, count) => {
     if (!seed.trim() && type === 'evergreen') {
@@ -423,8 +513,8 @@ export default function EditorialDesk() {
     setModal({ type: 'loading', message: `Generating ${count} ${type} topics${seed ? ` on "${seed}"` : ''}…` });
     const sitemapContext = buildSitemapContext();
     const prompt = buildTopicPrompt(type, seed, count, settings.instructions, sitemapContext);
-    const useSearch = type === 'news';
-    const maxT = type === 'news' ? 6000 : 8000;
+    const useSearch = type === 'news' || type === 'mythbusting';
+    const maxT = (type === 'news' || type === 'mythbusting') ? 6000 : 8000;
     let text;
     try {
       text = await callClaude(prompt, useSearch, maxT);
@@ -464,7 +554,9 @@ export default function EditorialDesk() {
   const writeArticle = async (topic) => {
     updateTopic(topic.id, { status: 'writing' });
     try {
-      const prompt = buildArticlePrompt(topic, settings.instructions, settings.style);
+      const linkingContext = buildLinkingContext();
+      const catTraining = categoryTraining[topic.category] || '';
+      const prompt = buildArticlePrompt(topic, settings.instructions, settings.style, linkingContext, catTraining);
       const text = await callClaude(prompt, true, 6000);
       const parsed = parseArticleOutput(text);
       const draft = {
@@ -476,6 +568,7 @@ export default function EditorialDesk() {
         excerpt: parsed.excerpt || '',
         tags: parsed.tags || [],
         category: parsed.category || topic.category || '',
+        cluster: topic.cluster || '',
         content: parsed.content || text,
         status: 'pending',
         createdAt: Date.now()
@@ -707,6 +800,8 @@ Return ONLY a JSON array (no preamble, no fences):
               + drafts.filter(d => d.type === 'evergreen' && d.status === 'pending').length,
     news: topics.filter(t => t.type === 'news' && t.status === 'pending').length
         + drafts.filter(d => d.type === 'news' && d.status === 'pending').length,
+    mythbusting: topics.filter(t => t.type === 'mythbusting' && t.status === 'pending').length
+              + drafts.filter(d => d.type === 'mythbusting' && d.status === 'pending').length,
     library: libraryItems.length,
   };
 
@@ -741,7 +836,7 @@ Return ONLY a JSON array (no preamble, no fences):
           />
         )}
 
-        {(view === 'evergreen' || view === 'news') && (
+        {(view === 'evergreen' || view === 'news' || view === 'mythbusting') && (
           <PipelineView
             type={view}
             seed={seeds[view]}
@@ -766,6 +861,7 @@ Return ONLY a JSON array (no preamble, no fences):
             onView={(d) => setModal({ type: 'draft', draft: d, fromLibrary: true })}
             onExport={(d) => setModal({ type: 'export', item: d })}
             onDelete={deleteLibraryItem}
+            onToggleDeployed={toggleDeployed}
             showToast={showToast}
           />
         )}
@@ -776,6 +872,8 @@ Return ONLY a JSON array (no preamble, no fences):
             settings={settings}
             drafts={drafts}
             libraryItems={libraryItems}
+            categoryTraining={categoryTraining}
+            onSaveCategoryTraining={(next) => { saveCategoryTraining(next); showToast('Category training saved', 'success'); }}
             onRunSample={() => setModal({ type: 'sampleForm' })}
             onCritique={() => setModal({ type: 'critiqueForm' })}
             onLearn={() => setModal({ type: 'learnForm' })}
@@ -928,7 +1026,7 @@ Mix angles widely:
 - SA-specific contexts (medical aid, public clinics, local foods, climate)
 - Common reader questions
 
-Vary across categories: nutrition, wellness, men's health, women's health.
+Vary across categories: fitness, nutrition, mental_health, health_guides, beauty.
 
 Return ONLY a JSON array (no markdown fences, no preamble). Each item:
 {
@@ -937,7 +1035,41 @@ Return ONLY a JSON array (no markdown fences, no preamble). Each item:
   "keyword": "primary SEO keyword (must NOT match any existing keyword above)",
   "cluster": "topical cluster — existing one from the sitemap, or a new cluster name",
   "whyEvergreen": "why this stays relevant year-round",
-  "category": "nutrition" | "wellness" | "mens" | "womens",
+  "category": "fitness" | "nutrition" | "mental_health" | "health_guides" | "beauty",
+  "effort": "quick" | "standard" | "deep"
+}`;
+  }
+  if (type === 'mythbusting') {
+    return `${instructions}${siteBlock}
+
+Now generate ${count} MYTH-BUSTING / CLICKBAIT-STYLE article topics${seed ? ` related to: "${seed}"` : ' on SA health misinformation'}.
+
+These are punchy, curiosity-driving pieces that take a common health belief, viral claim, social-media trend, or oft-repeated piece of advice and either confirm, debunk, or nuance it with real evidence. The HOOK is the headline. The PAYOFF is the truth.
+
+Search current SA social trends, TikTok health claims, WhatsApp-forwarded health myths, viral wellness influencers, and popular misconceptions in SA health forums.
+
+Style of headline (mix these patterns):
+- "No, [thing people believe] doesn't actually [outcome]"
+- "Is [trendy thing] really [good/bad] for you?"
+- "What [popular figure or trend] gets wrong about [topic]"
+- "Stop doing [X] — here's what works instead"
+- "The truth about [hyped ingredient/practice]"
+- "Why [common advice] is wrong for South Africans"
+- "[Number] [things] about [topic] that aren't true"
+
+Each topic must be tied to a SPECIFIC myth, claim, or trend (not a generic explainer). The article should always land on the evidence-backed answer, never just dunk on people.
+
+Vary across categories: fitness, nutrition, mental_health, health_guides, beauty.
+
+Return ONLY a JSON array (no markdown fences, no preamble). Each item:
+{
+  "title": "punchy headline under 65 chars",
+  "angle": "the actual answer — what evidence really says",
+  "keyword": "primary SEO keyword (must NOT match any existing keyword above)",
+  "cluster": "topical cluster — existing one from the sitemap, or a new cluster name",
+  "theMyth": "the exact claim being debunked, in one sentence",
+  "theTruth": "what evidence actually says, in one sentence",
+  "category": "fitness" | "nutrition" | "mental_health" | "health_guides" | "beauty",
   "effort": "quick" | "standard" | "deep"
 }`;
   }
@@ -950,7 +1082,7 @@ Search current South African health news, recent peer-reviewed studies (last 60 
 
 Each topic must be tied to a SPECIFIC recent event, study, policy change, season, or trend. No evergreen pieces.
 
-Vary across categories: nutrition, wellness, men's health, women's health.
+Vary across categories: fitness, nutrition, mental_health, health_guides, beauty.
 
 Return ONLY a JSON array (no markdown fences, no preamble). Each item:
 {
@@ -960,17 +1092,31 @@ Return ONLY a JSON array (no markdown fences, no preamble). Each item:
   "cluster": "topical cluster — existing one from the sitemap, or a new cluster name",
   "whyNow": "the specific news hook, study, or trigger with date",
   "source": "the publication or body the hook came from",
-  "category": "nutrition" | "wellness" | "mens" | "womens",
+  "category": "fitness" | "nutrition" | "mental_health" | "health_guides" | "beauty",
   "effort": "quick" | "standard" | "deep"
 }`;
 }
 
-function buildArticlePrompt(topic, instructions, style) {
-  const whyContext = topic.whyEvergreen || topic.whyNow || '';
-  return `${instructions}
+function buildArticlePrompt(topic, instructions, style, linkingContext = '', categoryTraining = '') {
+  const whyContext = topic.whyEvergreen || topic.whyNow || topic.theMyth || '';
+  const myth = topic.theMyth ? `\n- The myth: ${topic.theMyth}` : '';
+  const truth = topic.theTruth ? `\n- The evidence-backed truth: ${topic.theTruth}` : '';
+  const catBlock = categoryTraining ? `\n\nCATEGORY-SPECIFIC TRAINING for "${topic.category}":\n${categoryTraining}` : '';
+  const linkBlock = linkingContext ? `\n\n${linkingContext}` : '';
+
+  let lengthGuide = '1000–1400';
+  let typeNote = '';
+  if (topic.type === 'news') {
+    lengthGuide = '600–900';
+  } else if (topic.type === 'mythbusting') {
+    lengthGuide = '700–1000';
+    typeNote = `\n\nMYTHBUSTING STRUCTURE:\n1. Hook with the myth as a question or bold statement.\n2. Where the claim comes from (the source, the influencer, the cultural pattern).\n3. What the evidence actually says — peer-reviewed studies, SA bodies, experts.\n4. The nuanced truth — usually neither "always" nor "never".\n5. What to do instead (the practical takeaway).\n6. Bottom-line bullets.`;
+  }
+
+  return `${instructions}${catBlock}
 
 House style reference:
-${style}
+${style}${linkBlock}
 
 Now write a complete, publication-ready article.
 
@@ -979,9 +1125,10 @@ Topic details:
 - Angle: ${topic.angle}
 - Primary keyword: ${topic.keyword}
 - Category: ${topic.category}
-- Context: ${whyContext}
+- Cluster: ${topic.cluster || 'Unclustered'}
+- Context: ${whyContext}${myth}${truth}
 - Type: ${topic.type}
-- Target length: ${topic.type === 'news' ? '600–900' : '1000–1400'} words
+- Target length: ${lengthGuide} words${typeNote}
 
 Research the topic using web search before writing. Use SA sources where possible.
 
@@ -991,13 +1138,13 @@ TITLE: <final headline, under 65 chars>
 META: <meta description for SEO, 150–160 chars>
 EXCERPT: <2–3 sentence article teaser>
 TAGS: <comma-separated tags, 4–7 of them>
-CATEGORY: <nutrition | wellness | mens | womens>
+CATEGORY: <fitness | nutrition | mental_health | health_guides | beauty>
 
 ---
 
 <the full article in markdown — # for the H1 title, ## for H2 subheads, ### for H3 if needed, **bold**, *italic*, lists with - or 1., links as [text](url), > for the "see a doctor" callout box>
 
-Include all required sections per our house structure: hook, body with H2 subheads every 200–300 words, bottom-line bullets, "when to see a doctor" callout if relevant, numbered sources list at the end.
+Include all required sections per our house structure: hook, body with H2 subheads every 200–300 words, bottom-line bullets, "when to see a doctor" callout if relevant, numbered sources list at the end. Where natural, include 2–5 internal links to the pages listed under INTERNAL LINK TARGETS using markdown link syntax.
 
 No preamble before TITLE. No commentary after the article.`;
 }
@@ -1011,6 +1158,7 @@ function Header({ view, setView, counts }) {
     { id: 'sitemap', label: 'Sitemap', icon: Network, badge: counts.sitemap },
     { id: 'evergreen', label: 'Evergreen', icon: Sprout, badge: counts.evergreen },
     { id: 'news', label: 'News', icon: Newspaper, badge: counts.news },
+    { id: 'mythbusting', label: 'Mythbust', icon: Zap, badge: counts.mythbusting },
     { id: 'library', label: 'Library', icon: Library, badge: counts.library },
     { id: 'train', label: 'Train', icon: GraduationCap },
     { id: 'prompts', label: 'Prompts', icon: BookOpen },
@@ -1059,18 +1207,30 @@ function PipelineView({
   const [tab, setTab] = useState('topics');
   const [filter, setFilter] = useState('pending');
 
-  const isEvergreen = type === 'evergreen';
-  const meta = {
-    eyebrow: isEvergreen ? '01 · Evergreen pipeline' : '02 · News pipeline',
-    title: isEvergreen ? 'Evergreen' : 'News',
-    sub: isEvergreen
-      ? 'Timeless reference pieces. Input a topic, generate ideas, approve to write, ship to library.'
-      : 'Time-sensitive pieces tied to current SA health news, studies, and trends.',
-    placeholder: isEvergreen
-      ? 'e.g. iron deficiency, menopause, sleep, intermittent fasting…'
-      : 'e.g. diabetes, NHI, load shedding mental health (leave blank for general SA health news)',
-    icon: isEvergreen ? Sprout : Newspaper,
+  const META = {
+    evergreen: {
+      eyebrow: '01 · Evergreen pipeline',
+      title: 'Evergreen',
+      sub: 'Timeless reference pieces. Input a topic, generate ideas, approve to write, ship to library.',
+      placeholder: 'e.g. iron deficiency, menopause, sleep, intermittent fasting…',
+      icon: Sprout,
+    },
+    news: {
+      eyebrow: '02 · News pipeline',
+      title: 'News',
+      sub: 'Time-sensitive pieces tied to current SA health news, studies, and trends.',
+      placeholder: 'e.g. diabetes, NHI, load shedding mental health (leave blank for general SA health news)',
+      icon: Newspaper,
+    },
+    mythbusting: {
+      eyebrow: '03 · Mythbusting pipeline',
+      title: 'Mythbust',
+      sub: 'Punchy, click-friendly pieces that take a viral claim or common belief and land on the evidence. Always honest, never just dunking.',
+      placeholder: 'e.g. apple cider vinegar, seed oils, cold plunges (leave blank to scan SA viral health claims)',
+      icon: Zap,
+    },
   };
+  const meta = META[type] || META.evergreen;
 
   const filteredTopics = topics.filter(t => {
     if (filter === 'all') return true;
@@ -1252,8 +1412,10 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete }) {
   }[topic.status];
 
   const categoryLabel = {
-    nutrition: 'Nutrition', wellness: 'Wellness',
-    mens: "Men's", womens: "Women's"
+    fitness: 'Fitness', nutrition: 'Nutrition', mental_health: 'Mental health',
+    health_guides: 'Health guides', beauty: 'Beauty',
+    // legacy
+    wellness: 'Health guides', mens: 'Health guides', womens: 'Health guides'
   }[topic.category] || topic.category;
 
   const isWriting = topic.status === 'writing';
@@ -1323,6 +1485,24 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete }) {
               <span style={styles.expandValue}>{topic.whyNow}</span>
             </div>
           )}
+          {topic.theMyth && (
+            <div style={styles.expandRow}>
+              <span style={styles.expandLabel}>The myth</span>
+              <span style={styles.expandValue}>{topic.theMyth}</span>
+            </div>
+          )}
+          {topic.theTruth && (
+            <div style={styles.expandRow}>
+              <span style={styles.expandLabel}>The truth</span>
+              <span style={styles.expandValue}>{topic.theTruth}</span>
+            </div>
+          )}
+          {topic.cluster && (
+            <div style={styles.expandRow}>
+              <span style={styles.expandLabel}>Cluster</span>
+              <span style={styles.expandValue}>{topic.cluster}</span>
+            </div>
+          )}
           {topic.source && (
             <div style={styles.expandRow}>
               <span style={styles.expandLabel}>Source</span>
@@ -1389,28 +1569,43 @@ function DraftRow({ draft, onView, onPublish, onReject, onDelete }) {
 // LIBRARY
 // ============================================================================
 
-function LibraryView({ items, onView, onExport, onDelete, showToast }) {
+function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, showToast }) {
   const [filter, setFilter] = useState('all');
-  const filtered = items.filter(i => filter === 'all' || i.type === filter);
+  const [deployFilter, setDeployFilter] = useState('all');
+  const filtered = items.filter(i => {
+    if (filter !== 'all' && i.type !== filter) return false;
+    if (deployFilter === 'deployed' && !i.deployed) return false;
+    if (deployFilter === 'pending' && i.deployed) return false;
+    return true;
+  });
 
   const filters = [
-    { id: 'all', label: 'All', count: items.length },
+    { id: 'all', label: 'All types', count: items.length },
     { id: 'evergreen', label: 'Evergreen', count: items.filter(i => i.type === 'evergreen').length },
     { id: 'news', label: 'News', count: items.filter(i => i.type === 'news').length },
+    { id: 'mythbusting', label: 'Mythbust', count: items.filter(i => i.type === 'mythbusting').length },
+  ];
+  const deployFilters = [
+    { id: 'all', label: 'All', count: items.length },
+    { id: 'pending', label: 'Awaiting deploy', count: items.filter(i => !i.deployed).length },
+    { id: 'deployed', label: 'Deployed', count: items.filter(i => i.deployed).length },
   ];
 
   if (items.length === 0) {
     return (
       <>
-        <PageHead eyebrow="03" title="Library" sub="Approved articles ready to export to WordPress." />
+        <PageHead eyebrow="04" title="Library" sub="Approved articles ready to export to WordPress." />
         <EmptyState icon={Library} title="Nothing in the library yet" hint="Approved drafts land here, ready for WordPress export." />
       </>
     );
   }
 
+  const typeColor = (t) => t === 'evergreen' ? '#2D5F4E' : t === 'news' ? '#C77D4A' : t === 'mythbusting' ? '#A14438' : '#6B6657';
+  const typeLabel = (t) => t === 'evergreen' ? 'Evergreen' : t === 'news' ? 'News' : t === 'mythbusting' ? 'Mythbust' : t;
+
   return (
     <>
-      <PageHead eyebrow="03" title="Library" sub={`${items.length} finished ${items.length === 1 ? 'article' : 'articles'}.`} />
+      <PageHead eyebrow="04" title="Library" sub={`${items.length} finished ${items.length === 1 ? 'article' : 'articles'}.`} />
       <div style={styles.filterRow}>
         {filters.map(f => (
           <button
@@ -1422,22 +1617,45 @@ function LibraryView({ items, onView, onExport, onDelete, showToast }) {
           </button>
         ))}
       </div>
+      <div style={styles.filterRow}>
+        {deployFilters.map(f => (
+          <button
+            key={f.id}
+            onClick={() => setDeployFilter(f.id)}
+            style={{ ...styles.filterBtn, ...(deployFilter === f.id ? styles.filterBtnActive : {}) }}
+          >
+            {f.label} <span style={styles.filterCount}>{f.count}</span>
+          </button>
+        ))}
+      </div>
       <div style={styles.draftList}>
         {filtered.map(item => (
           <article key={item.id} style={styles.draftRow} onClick={() => onView(item)}>
             <div style={styles.draftLeft}>
               <div style={styles.draftMeta}>
-                <span style={{ ...styles.statusDot, background: item.type === 'evergreen' ? '#2D5F4E' : '#C77D4A' }} />
-                <span style={styles.cardCategory}>{item.type === 'evergreen' ? 'Evergreen' : 'News'}</span>
+                <span style={{ ...styles.statusDot, background: typeColor(item.type) }} />
+                <span style={styles.cardCategory}>{typeLabel(item.type)}</span>
                 <span style={styles.cardDot}>·</span>
                 <span>{item.category}</span>
                 <span style={styles.cardDot}>·</span>
                 <span>Published {timeAgo(item.publishedAt)}</span>
+                {item.deployed && (
+                  <span style={styles.doneChip}>
+                    <Rocket size={11} /> deployed
+                  </span>
+                )}
               </div>
               <h3 style={styles.draftTitle}>{item.title}</h3>
               <p style={styles.draftPreview}>{item.excerpt || item.content.replace(/[#*_`>]/g, '').slice(0, 180)}…</p>
             </div>
             <div style={styles.draftActions} onClick={e => e.stopPropagation()}>
+              <button
+                style={{ ...styles.iconActionBtn, ...(item.deployed ? styles.iconActionPrimary : {}) }}
+                onClick={() => onToggleDeployed(item.id)}
+                title={item.deployed ? 'Mark as not deployed' : 'Mark as deployed to live site'}
+              >
+                <Rocket size={15} />
+              </button>
               <button style={{ ...styles.iconActionBtn, ...styles.iconActionPrimary }} onClick={() => onExport(item)} title="Export to WordPress">
                 <FileCode size={15} />
               </button>
@@ -1884,6 +2102,7 @@ function FormattedMarkdown({ text }) {
 
 function TrainView({
   events, settings, drafts, libraryItems,
+  categoryTraining, onSaveCategoryTraining,
   onRunSample, onCritique, onLearn,
   onSubmitFeedback, onApplyPatch, onDismissPatch,
   onDelete, onViewPrompt
@@ -1905,6 +2124,12 @@ function TrainView({
         eyebrow="06 · Train"
         title="Train"
         sub="Run samples, give feedback, and refine the prompt. Every accepted patch updates the system instructions."
+      />
+
+      {/* Category training panel */}
+      <CategoryTrainingPanel
+        categoryTraining={categoryTraining}
+        onSave={onSaveCategoryTraining}
       />
 
       {/* Prompt summary panel */}
@@ -1982,6 +2207,88 @@ function TrainView({
         </div>
       )}
     </>
+  );
+}
+
+function CategoryTrainingPanel({ categoryTraining, onSave }) {
+  const [open, setOpen] = useState(true);
+  const [active, setActive] = useState(CATEGORIES[0].id);
+  const [drafts, setDrafts] = useState(categoryTraining || {});
+
+  // Re-sync when parent updates
+  useEffect(() => { setDrafts(categoryTraining || {}); }, [categoryTraining]);
+
+  const dirty = CATEGORIES.some(c => (drafts[c.id] || '') !== (categoryTraining[c.id] || ''));
+
+  const save = () => onSave(drafts);
+  const reset = () => setDrafts(categoryTraining || {});
+  const resetToDefault = (id) => setDrafts(d => ({ ...d, [id]: DEFAULT_CATEGORY_TRAINING[id] }));
+
+  return (
+    <div style={styles.catTrainPanel}>
+      <header style={styles.catTrainHeader} onClick={() => setOpen(!open)}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button style={styles.expandBtn}>
+            {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+          </button>
+          <div>
+            <div style={styles.catTrainTitle}>Category training</div>
+            <div style={styles.catTrainSub}>Per-category instructions appended whenever content for that category is generated.</div>
+          </div>
+        </div>
+        {dirty && (
+          <div style={{ display: 'flex', gap: 8 }} onClick={e => e.stopPropagation()}>
+            <button style={styles.secondaryBtn} onClick={reset}>Cancel</button>
+            <button style={styles.primaryBtn} onClick={save}>
+              <Save size={15} /> Save changes
+            </button>
+          </div>
+        )}
+      </header>
+
+      {open && (
+        <div style={styles.catTrainBody}>
+          {/* Category tabs */}
+          <div style={styles.catTabs}>
+            {CATEGORIES.map(c => {
+              const isDirty = (drafts[c.id] || '') !== (categoryTraining[c.id] || '');
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => setActive(c.id)}
+                  style={{
+                    ...styles.catTab,
+                    ...(active === c.id ? styles.catTabActive : {}),
+                  }}
+                >
+                  {c.label}
+                  {isDirty && <span style={styles.catDirtyDot} />}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Active category editor */}
+          <div style={styles.catEditorWrap}>
+            <div style={styles.catEditorTopBar}>
+              <span style={styles.catTrainHint}>
+                Plain instructions — bullet list works well. Will be included with every generation for this category.
+              </span>
+              <button style={styles.linkBtn} onClick={() => resetToDefault(active)}>
+                <RotateCcw size={12} /> Reset to default
+              </button>
+            </div>
+            <textarea
+              value={drafts[active] || ''}
+              onChange={e => setDrafts(d => ({ ...d, [active]: e.target.value }))}
+              style={styles.catTrainArea}
+              rows={14}
+              placeholder={`Instructions specific to ${CATEGORIES.find(c => c.id === active)?.label}…`}
+            />
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2351,45 +2658,60 @@ function ViewPromptPanel({ settings, onClose, showToast }) {
 // ============================================================================
 
 function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster }) {
+  const [viewMode, setViewMode] = useState('visual'); // 'visual' | 'detailed'
   const [collapsed, setCollapsed] = useState({});
 
   // Aggregate everything into clusters
   const clusters = {};
   const addToCluster = (item, status, kind) => {
     const c = item.cluster || 'Unclustered';
-    if (!clusters[c]) clusters[c] = { live: [], planned: [], drafting: [], ready: [] };
+    if (!clusters[c]) clusters[c] = { live: [], planned: [], writing: [], drafting: [], ready: [], deployed: [] };
     const bucket = status === 'LIVE' ? 'live'
                 : status === 'PLANNED' ? 'planned'
+                : status === 'WRITING' ? 'writing'
                 : status === 'DRAFT' ? 'drafting'
+                : status === 'DEPLOYED' ? 'deployed'
                 : 'ready';
     clusters[c][bucket].push({ ...item, kind, _status: status });
   };
   sitePages.forEach(p => addToCluster(p, 'LIVE', 'page'));
-  topics.filter(t => ['pending', 'writing', 'written'].includes(t.status))
-    .forEach(t => addToCluster(t, 'PLANNED', 'topic'));
+  topics.filter(t => ['pending', 'writing', 'written'].includes(t.status)).forEach(t => {
+    addToCluster(t, t.status === 'writing' ? 'WRITING' : 'PLANNED', 'topic');
+  });
   drafts.forEach(d => addToCluster(d, 'DRAFT', 'draft'));
-  libraryItems.forEach(l => addToCluster(l, 'READY', 'library'));
+  libraryItems.forEach(l => addToCluster(l, l.deployed ? 'DEPLOYED' : 'READY', 'library'));
 
   // Sort clusters: most items first, "Unclustered" last
   const clusterEntries = Object.entries(clusters).sort((a, b) => {
     if (a[0] === 'Unclustered') return 1;
     if (b[0] === 'Unclustered') return -1;
-    const aCount = a[1].live.length + a[1].planned.length + a[1].drafting.length + a[1].ready.length;
-    const bCount = b[1].live.length + b[1].planned.length + b[1].drafting.length + b[1].ready.length;
+    const aCount = Object.values(a[1]).reduce((s, arr) => s + arr.length, 0);
+    const bCount = Object.values(b[1]).reduce((s, arr) => s + arr.length, 0);
     return bCount - aCount;
   });
 
   const totalLive = sitePages.length;
   const totalPlanned = topics.filter(t => ['pending', 'writing', 'written'].includes(t.status)).length;
   const totalDraft = drafts.length;
-  const totalReady = libraryItems.length;
+  const totalReady = libraryItems.filter(l => !l.deployed).length;
+  const totalDeployed = libraryItems.filter(l => l.deployed).length;
+
+  // Status legend
+  const STATUS_COLORS = {
+    LIVE: { bg: '#3A5266', label: 'Live on site' },
+    PLANNED: { bg: '#C77D4A', label: 'Planned' },
+    WRITING: { bg: '#D4A856', label: 'Writing' },
+    DRAFT: { bg: '#5B8A78', label: 'Drafted' },
+    READY: { bg: '#234B3D', label: 'Ready to publish' },
+    DEPLOYED: { bg: '#1A3D32', label: 'Deployed' },
+  };
 
   return (
     <>
       <PageHead
         eyebrow="00 · Topical authority"
         title="Sitemap"
-        sub="Every live page, every planned topic, every draft — grouped by cluster. Topic generation references this map to avoid cannibalisation."
+        sub="Visual map of every page — live, planned, written, deployed. Generation references this to avoid cannibalisation."
         action={
           <div style={{ display: 'flex', gap: 8 }}>
             <button style={styles.secondaryBtn} onClick={onBulkAdd}>
@@ -2405,22 +2727,128 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
       {/* Stats strip */}
       <div style={styles.statsStrip}>
         <SitemapStat label="Clusters" value={clusterEntries.length} />
-        <SitemapStat label="Live pages" value={totalLive} accent="#3A5266" />
-        <SitemapStat label="Planned topics" value={totalPlanned} accent="#C77D4A" />
-        <SitemapStat label="In draft" value={totalDraft} accent="#2D5F4E" />
-        <SitemapStat label="Ready to publish" value={totalReady} accent="#234B3D" />
+        <SitemapStat label="Live" value={totalLive} accent={STATUS_COLORS.LIVE.bg} />
+        <SitemapStat label="Planned" value={totalPlanned} accent={STATUS_COLORS.PLANNED.bg} />
+        <SitemapStat label="In draft" value={totalDraft} accent={STATUS_COLORS.DRAFT.bg} />
+        <SitemapStat label="Ready" value={totalReady} accent={STATUS_COLORS.READY.bg} />
+        <SitemapStat label="Deployed" value={totalDeployed} accent={STATUS_COLORS.DEPLOYED.bg} />
+      </div>
+
+      {/* View toggle and legend */}
+      <div style={styles.sitemapControls}>
+        <div style={styles.viewToggle}>
+          <button
+            onClick={() => setViewMode('visual')}
+            style={{ ...styles.viewToggleBtn, ...(viewMode === 'visual' ? styles.viewToggleBtnActive : {}) }}
+          >
+            <Eye size={14} /> Visual map
+          </button>
+          <button
+            onClick={() => setViewMode('detailed')}
+            style={{ ...styles.viewToggleBtn, ...(viewMode === 'detailed' ? styles.viewToggleBtnActive : {}) }}
+          >
+            <FileText size={14} /> Detailed list
+          </button>
+        </div>
+        <div style={styles.legend}>
+          {Object.entries(STATUS_COLORS).map(([key, { bg, label }]) => (
+            <div key={key} style={styles.legendItem}>
+              <span style={{ ...styles.legendDot, background: bg }} />
+              <span>{label}</span>
+            </div>
+          ))}
+        </div>
       </div>
 
       {clusterEntries.length === 0 ? (
         <EmptyState
           icon={Network}
           title="No coverage map yet"
-          hint="Add the pages already live on your site. Then generate topics — Claude will see this map and avoid duplicating them."
+          hint="Add the pages already live on your site, or generate some topics. The map fills in as you work."
         />
+      ) : viewMode === 'visual' ? (
+        <div style={styles.visualClusterGrid}>
+          {clusterEntries.map(([clusterName, buckets]) => {
+            const allItems = [
+              ...buckets.live.map(i => ({ ...i, _color: STATUS_COLORS.LIVE.bg })),
+              ...buckets.deployed.map(i => ({ ...i, _color: STATUS_COLORS.DEPLOYED.bg })),
+              ...buckets.ready.map(i => ({ ...i, _color: STATUS_COLORS.READY.bg })),
+              ...buckets.drafting.map(i => ({ ...i, _color: STATUS_COLORS.DRAFT.bg })),
+              ...buckets.writing.map(i => ({ ...i, _color: STATUS_COLORS.WRITING.bg })),
+              ...buckets.planned.map(i => ({ ...i, _color: STATUS_COLORS.PLANNED.bg })),
+            ];
+            const total = allItems.length;
+            // Coverage strength: more items + more "live/deployed" = stronger
+            const liveCount = buckets.live.length + buckets.deployed.length + buckets.ready.length;
+            const strength = total === 0 ? 0 : Math.min(100, Math.round((liveCount / total) * 100));
+
+            return (
+              <section key={clusterName} style={styles.visualCluster}>
+                <header style={styles.visualClusterHead}>
+                  <div>
+                    <h3 style={styles.clusterTitle}>{clusterName}</h3>
+                    <div style={styles.clusterSub}>
+                      {total} {total === 1 ? 'page' : 'pages'} · {strength}% live or ready
+                    </div>
+                  </div>
+                  <div style={styles.coverageBar}>
+                    {Object.entries({
+                      live: buckets.live.length,
+                      deployed: buckets.deployed.length,
+                      ready: buckets.ready.length,
+                      drafting: buckets.drafting.length,
+                      writing: buckets.writing.length,
+                      planned: buckets.planned.length,
+                    }).filter(([, n]) => n > 0).map(([key, n]) => {
+                      const colorMap = {
+                        live: STATUS_COLORS.LIVE.bg,
+                        deployed: STATUS_COLORS.DEPLOYED.bg,
+                        ready: STATUS_COLORS.READY.bg,
+                        drafting: STATUS_COLORS.DRAFT.bg,
+                        writing: STATUS_COLORS.WRITING.bg,
+                        planned: STATUS_COLORS.PLANNED.bg,
+                      };
+                      return (
+                        <div
+                          key={key}
+                          style={{
+                            background: colorMap[key],
+                            flex: n,
+                            height: '100%',
+                          }}
+                          title={`${n} ${key}`}
+                        />
+                      );
+                    })}
+                  </div>
+                </header>
+
+                <div style={styles.nodeGrid}>
+                  {allItems.map(item => (
+                    <button
+                      key={item.id}
+                      style={{
+                        ...styles.node,
+                        background: item._color,
+                        ...(item._status === 'WRITING' ? { animation: 'pulse 1.5s ease-in-out infinite' } : {}),
+                      }}
+                      onClick={() => item.kind === 'page' ? onEdit(item) : null}
+                      title={`${item.title}${item.keyword ? ` — ${item.keyword}` : ''}${item.url ? `\n${item.url}` : ''}`}
+                    >
+                      <span style={styles.nodeTitle}>{item.title}</span>
+                      <span style={styles.nodeStatus}>{item._status.toLowerCase()}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            );
+          })}
+        </div>
       ) : (
+        // Detailed list (original)
         <div style={styles.clusterList}>
           {clusterEntries.map(([clusterName, buckets]) => {
-            const total = buckets.live.length + buckets.planned.length + buckets.drafting.length + buckets.ready.length;
+            const total = Object.values(buckets).reduce((s, arr) => s + arr.length, 0);
             const isCollapsed = collapsed[clusterName];
             return (
               <section key={clusterName} style={styles.clusterCard}>
@@ -2432,8 +2860,10 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
                   <div style={styles.clusterMeta}>
                     {buckets.live.length > 0 && <span style={{ ...styles.clusterChip, background: '#E3EAEE', color: '#3A5266' }}>{buckets.live.length} live</span>}
                     {buckets.planned.length > 0 && <span style={{ ...styles.clusterChip, background: '#F4E4D2', color: '#9C5E2C' }}>{buckets.planned.length} planned</span>}
+                    {buckets.writing.length > 0 && <span style={{ ...styles.clusterChip, background: '#F5E6C5', color: '#8A6628' }}>{buckets.writing.length} writing</span>}
                     {buckets.drafting.length > 0 && <span style={{ ...styles.clusterChip, background: '#E5EFE9', color: '#2D5F4E' }}>{buckets.drafting.length} draft</span>}
                     {buckets.ready.length > 0 && <span style={{ ...styles.clusterChip, background: '#D6E3DC', color: '#234B3D' }}>{buckets.ready.length} ready</span>}
+                    {buckets.deployed.length > 0 && <span style={{ ...styles.clusterChip, background: '#C2D3CB', color: '#1A3D32' }}>{buckets.deployed.length} deployed</span>}
                     <span style={styles.clusterTotal}>{total} {total === 1 ? 'page' : 'pages'}</span>
                   </div>
                 </header>
@@ -2443,8 +2873,10 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
                     {[
                       { key: 'live', label: 'Live', items: buckets.live },
                       { key: 'planned', label: 'Planned (topics)', items: buckets.planned },
+                      { key: 'writing', label: 'Writing', items: buckets.writing },
                       { key: 'drafting', label: 'In draft', items: buckets.drafting },
                       { key: 'ready', label: 'Ready to publish', items: buckets.ready },
+                      { key: 'deployed', label: 'Deployed', items: buckets.deployed },
                     ].filter(b => b.items.length > 0).map(b => (
                       <div key={b.key}>
                         <div style={styles.bucketLabel}>{b.label}</div>
@@ -2566,13 +2998,7 @@ function SitePageForm({ page, existingClusters, onSubmit, onClose }) {
 
       <label style={styles.formLabel}>Category <span style={styles.optional}>optional</span></label>
       <div style={styles.segmented}>
-        {[
-          { id: '', label: 'None' },
-          { id: 'nutrition', label: 'Nutrition' },
-          { id: 'wellness', label: 'Wellness' },
-          { id: 'mens', label: "Men's" },
-          { id: 'womens', label: "Women's" },
-        ].map(c => (
+        {[{ id: '', label: 'None' }, ...CATEGORIES].map(c => (
           <button
             key={c.id}
             onClick={() => setCategory(c.id)}
@@ -2652,6 +3078,7 @@ Menopause symptoms in your 40s | | menopause symptoms 40s | Menopause`}
 const globalCss = `
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
   * { box-sizing: border-box; }
   body { margin: 0; }
   textarea, input { font-family: inherit; }
@@ -2910,4 +3337,39 @@ const styles = {
   sitemapActions: { display: 'flex', gap: 4, flexShrink: 0 },
   clusterPills: { display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 8 },
   clusterPill: { padding: '4px 10px', fontSize: 11.5, background: colors.bg, color: colors.inkSoft, border: `1px solid ${colors.border}`, borderRadius: 999, cursor: 'pointer', fontFamily: fonts.body },
+
+  // Visual sitemap
+  sitemapControls: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 20, flexWrap: 'wrap' },
+  viewToggle: { display: 'flex', gap: 2, background: colors.surface, padding: 3, borderRadius: 999, border: `1px solid ${colors.border}` },
+  viewToggleBtn: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px', background: 'transparent', border: 'none', borderRadius: 999, fontSize: 12.5, color: colors.muted, fontWeight: 500, fontFamily: fonts.body },
+  viewToggleBtnActive: { background: colors.ink, color: colors.bg },
+  legend: { display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 11, color: colors.muted },
+  legendItem: { display: 'inline-flex', alignItems: 'center', gap: 5 },
+  legendDot: { width: 8, height: 8, borderRadius: '50%', display: 'inline-block' },
+
+  visualClusterGrid: { display: 'flex', flexDirection: 'column', gap: 16 },
+  visualCluster: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, padding: 20, overflow: 'hidden' },
+  visualClusterHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 18, marginBottom: 18, flexWrap: 'wrap' },
+  clusterSub: { fontSize: 11.5, color: colors.muted, marginTop: 4, letterSpacing: '0.02em' },
+  coverageBar: { display: 'flex', height: 8, minWidth: 200, flex: '0 1 280px', borderRadius: 999, overflow: 'hidden', background: colors.borderSoft },
+
+  nodeGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 8 },
+  node: { background: colors.muted, color: '#FFFFFF', padding: '12px 14px', borderRadius: 4, border: 'none', textAlign: 'left', display: 'flex', flexDirection: 'column', gap: 6, cursor: 'pointer', minHeight: 64, transition: 'transform 0.15s, box-shadow 0.15s', fontFamily: fonts.body },
+  nodeTitle: { fontSize: 12.5, fontWeight: 500, lineHeight: 1.3, color: '#FFFFFF', overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', textShadow: '0 1px 1px rgba(0,0,0,0.1)' },
+  nodeStatus: { fontSize: 9.5, textTransform: 'uppercase', letterSpacing: '0.1em', opacity: 0.85, fontWeight: 600, marginTop: 'auto' },
+
+  // Category training panel
+  catTrainPanel: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, marginBottom: 28, overflow: 'hidden' },
+  catTrainHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '18px 22px', cursor: 'pointer', userSelect: 'none', gap: 16, flexWrap: 'wrap' },
+  catTrainTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', lineHeight: 1.2, fontVariationSettings: '"opsz" 60' },
+  catTrainSub: { fontSize: 13, color: colors.muted, marginTop: 4, lineHeight: 1.45 },
+  catTrainBody: { borderTop: `1px solid ${colors.borderSoft}`, padding: '18px 22px 22px' },
+  catTabs: { display: 'flex', gap: 4, marginBottom: 16, flexWrap: 'wrap' },
+  catTab: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 999, fontSize: 13, color: colors.inkSoft, fontWeight: 500, fontFamily: fonts.body },
+  catTabActive: { background: colors.ink, color: colors.bg, borderColor: colors.ink },
+  catDirtyDot: { width: 6, height: 6, borderRadius: '50%', background: colors.ochre, display: 'inline-block' },
+  catEditorWrap: {},
+  catEditorTopBar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 10, flexWrap: 'wrap' },
+  catTrainHint: { fontSize: 12, color: colors.muted, fontStyle: 'italic' },
+  catTrainArea: { width: '100%', padding: 14, fontSize: 13.5, lineHeight: 1.6, border: `1px solid ${colors.border}`, borderRadius: 4, fontFamily: fonts.body, background: colors.bg, resize: 'vertical', color: colors.inkSoft, minHeight: 280 },
 };
