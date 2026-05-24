@@ -110,9 +110,130 @@ Same app as the artifact, but now:
 
 ---
 
-## Optional: custom domain
+## Connect to WordPress (recommended)
 
-If you want `editorial.yoursite.co.za` instead of `editorial-desk-abc123.vercel.app`:
+This lets the app push approved articles to your WordPress site automatically as draft posts. You then review and publish from WordPress admin.
+
+### 1. Enable Application Passwords in WordPress
+
+Application passwords are built into WordPress 5.6+. They're separate from your login password, can be revoked individually, and don't grant admin access.
+
+1. Log into your WordPress admin.
+2. Go to **Users → Profile** (or **Users → Your username**).
+3. Scroll to the **Application Passwords** section near the bottom.
+4. In "New Application Password Name", enter: `Editorial Desk`
+5. Click **Add New Application Password**.
+6. WordPress shows the password — looks like `xxxx xxxx xxxx xxxx xxxx xxxx` (24 chars). **Copy it now — you won't see it again.** Spaces are part of it but can be removed.
+
+If you don't see Application Passwords, your host may have disabled them. Bluehost, SiteGround, and most quality hosts have them enabled. Some shared hosts disable for "security" — contact support to enable.
+
+### 2. Add three environment variables in Vercel
+
+1. Vercel dashboard → your project → **Settings → Environment Variables**.
+2. Add three new variables (Production, Preview, and Development scopes):
+   - **`WP_URL`** — your WordPress site URL, no trailing slash. Example: `https://yoursite.co.za`
+   - **`WP_USER`** — your WordPress username (the one you log in with).
+   - **`WP_APP_PASSWORD`** — paste the application password from step 1.
+3. Save.
+4. Go to **Deployments** → click the most recent → three dots ⋯ → **Redeploy** so the new env vars take effect.
+
+### 3. Verify the connection
+
+Open your live app, go to the **Library** tab. Top of the page shows a banner:
+
+- ✅ Green: "Connected to WordPress as [your name]" → working.
+- ⚠️ Yellow: "WordPress credentials not set" → env vars missing, didn't redeploy, or wrong values.
+
+### 4. How pushing works
+
+In the Library, each article has a 🚀 button. Click it:
+
+1. The article is converted to clean HTML.
+2. The WordPress REST API creates a new post with **status: draft** (unpublished).
+3. Categories are matched by name — if your WordPress has a category called "Fitness", that's where Fitness articles land. If not, the post falls into Uncategorised.
+4. Tags are created automatically if they don't exist.
+5. If you have Yoast SEO active, the meta description gets set too.
+6. The library item flips to "Deployed" and shows an "in WordPress" link that opens the post's edit page in WP admin.
+
+The post is **never published automatically** — it's always a draft. You review in WordPress, add featured image, tweak categories if needed, then hit Publish.
+
+### Troubleshooting
+
+- **"401 Authentication failed"** → wrong username or app password. Generate a fresh app password and update the env var.
+- **"403 Forbidden"** → user doesn't have publishing rights. Make sure the WP user is an Editor or Administrator.
+- **"Could not reach WordPress"** → wrong URL, site is down, or REST API is blocked. Visit `https://yoursite.co.za/wp-json/wp/v2/posts` in your browser — should return JSON, not an error page.
+- **"Cloudflare/firewall blocking"** → some security plugins (Wordfence, etc.) block REST API requests by default. Either whitelist your Vercel IP, or temporarily disable the rule.
+
+---
+
+## Set up the database (required)
+
+The app stores users, content, and activity in Vercel KV — a Redis database that runs alongside your app.
+
+### 1. Add Vercel KV to your project
+
+1. In Vercel, open your project → **Storage** tab (top of project).
+2. Click **Create Database** → choose **KV** → name it `editorial-desk-kv` (or anything).
+3. Pick a region close to you (e.g. London for SA).
+4. Click **Create**.
+5. After creation, click **Connect Project** and select your `editorial-desk` project. Vercel will automatically add the required environment variables (`KV_URL`, `KV_REST_API_URL`, `KV_REST_API_TOKEN`, `KV_REST_API_READ_ONLY_TOKEN`) to your project.
+6. Go to **Deployments** → three dots ⋯ on the latest → **Redeploy** so the new env vars take effect.
+
+Free tier is 30,000 commands/month and 256MB of storage — more than enough for a small team.
+
+### 2. Create the first admin
+
+After redeploy, open your live URL. Because the database is empty, the app shows a one-time **"Create the first admin"** setup screen.
+
+1. Enter your name, a username (used to sign in), and an 8+ character password.
+2. Click **Create admin account**.
+3. You're signed in and the full app loads.
+
+From now on, that screen is gone forever. To add more users:
+
+1. Sign in as admin.
+2. Click the **Admin** tab (only visible to admins).
+3. Click **Add user**, fill in name/username/password/role, share credentials with them out-of-band.
+
+### Roles
+
+- **Admin** — everything: generate, approve, publish, push to WP, manage users, see reports.
+- **Editor** — generate, approve topics & drafts, edit drafts, push to WP. No user management.
+- **Contributor** — generate topics and drafts. Cannot approve anything. Their work shows up for admin/editor to review.
+
+---
+
+## Optional: stock images via Pexels
+
+Auto-attaches a relevant featured image to every WordPress push.
+
+### 1. Get a Pexels API key
+
+1. Go to **pexels.com/api** in your browser.
+2. Click **Get Started** → sign up (email or Google).
+3. Once signed in, copy your **API key** from the dashboard. Looks like `563492ad6f917000010000017ea...` (very long).
+
+Pexels is free, royalty-free, no attribution required (but we add photographer credit as the WP image caption anyway). Limits are 200 requests/hour, 20,000/month — far more than you'll use.
+
+### 2. Add the env var in Vercel
+
+1. Vercel → your project → **Settings → Environment Variables**.
+2. Add: **`PEXELS_API_KEY`** with your key as the value.
+3. Save → go to **Deployments** → redeploy.
+
+### 3. How it works
+
+- When an article is generated, Claude is asked to suggest a 4–6 word stock-photo search query (it appears in the article's IMAGE_QUERY metadata).
+- When you click 🚀 to push to WordPress, the system searches Pexels with that query.
+- The top match is uploaded to your WordPress media library and set as the post's featured image.
+- The photographer's name is set as the image caption (via Pexels' API attribution courtesy).
+- A small thumbnail of the chosen image appears beside the article in your Library.
+
+If Pexels can't find an image, or `PEXELS_API_KEY` isn't set, the article is still pushed — just without a featured image. You can always add one manually in WordPress.
+
+---
+
+## Optional: custom domain
 
 1. In Vercel → your project → **Settings → Domains**.
 2. Add the domain you want. Vercel shows you the DNS records to add.

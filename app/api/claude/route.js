@@ -1,10 +1,14 @@
 // Proxies requests to Anthropic's API with streaming.
-// Streaming keeps the connection alive past Vercel's 60s Hobby-tier limit,
-// since each SSE event resets the idle timer.
+// Auth-gated: only signed-in users can use it.
+
+import { requireUser } from '../../../lib/auth';
 
 export const runtime = 'edge';
 
 export async function POST(req) {
+  const { error } = await requireUser(req);
+  if (error) return error;
+
   if (!process.env.ANTHROPIC_API_KEY) {
     return new Response(
       JSON.stringify({ error: { message: 'ANTHROPIC_API_KEY environment variable not set on the server.' } }),

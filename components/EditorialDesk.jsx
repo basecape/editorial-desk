@@ -8,7 +8,7 @@ import {
   ArrowRight, Save, Download, MoreHorizontal, Sparkles,
   ExternalLink, FileCode, GraduationCap, Beaker, Wand2,
   MessageSquare, Lightbulb, RotateCcw, Network, Globe,
-  Zap, Rocket, Eye
+  Zap, Rocket, Eye, Menu
 } from 'lucide-react';
 
 // ============================================================================
@@ -94,20 +94,42 @@ const DEFAULT_CATEGORY_TRAINING = {
 // STORAGE
 // ============================================================================
 
+// Server-backed storage via /api/data/:key — auth is enforced by the API.
 const storage = {
   async get(key, fallback) {
     if (typeof window === 'undefined') return fallback;
     try {
-      const v = localStorage.getItem(key);
-      return v ? JSON.parse(v) : fallback;
+      const res = await fetch(`/api/data/${encodeURIComponent(key)}`, { credentials: 'same-origin' });
+      if (!res.ok) return fallback;
+      const data = await res.json();
+      return data.value === null || data.value === undefined ? fallback : data.value;
     } catch { return fallback; }
   },
   async set(key, value) {
     if (typeof window === 'undefined') return false;
-    try { localStorage.setItem(key, JSON.stringify(value)); return true; }
-    catch (e) { console.error('Storage set failed', e); return false; }
+    try {
+      const res = await fetch(`/api/data/${encodeURIComponent(key)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ value }),
+      });
+      return res.ok;
+    } catch (e) { console.error('Storage set failed', e); return false; }
   }
 };
+
+// Activity logger — fire-and-forget
+async function logAction(action, metadata = {}) {
+  try {
+    await fetch('/api/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ action, metadata }),
+    });
+  } catch {}
+}
 
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
@@ -233,8 +255,8 @@ function parseArticleOutput(text) {
     const [, header, rest] = fenceMatch;
     body = rest.trim();
     header.split('\n').forEach(line => {
-      const m = line.match(/^(TITLE|META|EXCERPT|TAGS|CATEGORY):\s*(.+)$/i);
-      if (m) fields[m[1].toLowerCase()] = m[2].trim();
+      const m = line.match(/^(TITLE|META|EXCERPT|TAGS|CATEGORY|IMAGE_QUERY):\s*(.+)$/i);
+      if (m) fields[m[1].toLowerCase().replace('image_query', 'imageQuery')] = m[2].trim();
     });
     if (fields.tags) fields.tags = fields.tags.split(',').map(s => s.trim()).filter(Boolean);
   }
@@ -304,9 +326,31 @@ export default function EditorialDesk() {
   const [sitePages, setSitePages] = useState([]);
   const [categoryTraining, setCategoryTraining] = useState(DEFAULT_CATEGORY_TRAINING);
   const [seeds, setSeeds] = useState({ evergreen: '', news: '', mythbusting: '' });
+  const [wpStatus, setWpStatus] = useState({ connected: false, checking: true });
   const [loaded, setLoaded] = useState(false);
   const [modal, setModal] = useState(null);
   const [toast, setToast] = useState(null);
+  const [theme, setTheme] = useState('light');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Load saved theme on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('theme');
+      if (saved === 'dark' || saved === 'light') setTheme(saved);
+      else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) setTheme('dark');
+    } catch {}
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem('theme', theme); } catch {}
+  }, [theme]);
+
+  // Auth state
+  const [authStatus, setAuthStatus] = useState({ checking: true, user: null, hasUsers: true });
+  const isAdmin = authStatus.user?.role === 'admin';
+  const isEditor = authStatus.user?.role === 'editor';
+  const isContributor = authStatus.user?.role === 'contributor';
+  const canApprove = isAdmin || isEditor;
 
   // Load fonts
   useEffect(() => {
@@ -317,8 +361,34 @@ export default function EditorialDesk() {
     return () => { try { document.head.removeChild(link); } catch {} };
   }, []);
 
-  // Load from storage with migration
+  // Auth check on mount
   useEffect(() => {
+    (async () => {
+      try {
+        // First check if any users exist
+        const setupRes = await fetch('/api/setup');
+        const setupData = await setupRes.json();
+        if (!setupData.hasUsers) {
+          setAuthStatus({ checking: false, user: null, hasUsers: false });
+          return;
+        }
+        // Then check current session
+        const meRes = await fetch('/api/auth/me', { credentials: 'same-origin' });
+        if (meRes.ok) {
+          const { user } = await meRes.json();
+          setAuthStatus({ checking: false, user, hasUsers: true });
+        } else {
+          setAuthStatus({ checking: false, user: null, hasUsers: true });
+        }
+      } catch (e) {
+        setAuthStatus({ checking: false, user: null, hasUsers: true, error: e.message });
+      }
+    })();
+  }, []);
+
+  // Load from storage with migration — only after auth check
+  useEffect(() => {
+    if (!authStatus.user) return;
     (async () => {
       const [t, d, l, p, s, te, sp, ct] = await Promise.all([
         storage.get('topics', []),
@@ -350,7 +420,21 @@ export default function EditorialDesk() {
       setCategoryTraining({ ...DEFAULT_CATEGORY_TRAINING, ...ct });
       setLoaded(true);
     })();
-  }, []);
+  }, [authStatus.user]);
+
+  // Check WordPress connection — only after auth
+  useEffect(() => {
+    if (!authStatus.user) return;
+    (async () => {
+      try {
+        const res = await fetch('/api/wordpress', { credentials: 'same-origin' });
+        const data = await res.json();
+        setWpStatus({ ...data, checking: false });
+      } catch (e) {
+        setWpStatus({ connected: false, checking: false, reason: 'fetch_failed', detail: e.message });
+      }
+    })();
+  }, [authStatus.user]);
 
   const showToast = (msg, type = 'info') => {
     setToast({ msg, type });
@@ -408,12 +492,15 @@ export default function EditorialDesk() {
       return next;
     });
     deleteDraft(draft.id);
+    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type });
     showToast('Published to library', 'success');
   };
   const deleteLibraryItem = (id) => {
     setLibraryItems(prev => {
+      const item = prev.find(i => i.id === id);
       const next = prev.filter(i => i.id !== id);
       storage.set('library', next);
+      if (item) logAction('library.delete', { title: item.title });
       return next;
     });
   };
@@ -444,10 +531,94 @@ export default function EditorialDesk() {
   // ---- deployed toggle (library items) ----
   const toggleDeployed = (id) => {
     setLibraryItems(prev => {
+      const item = prev.find(i => i.id === id);
       const next = prev.map(i => i.id === id ? { ...i, deployed: !i.deployed, deployedAt: !i.deployed ? Date.now() : null } : i);
       storage.set('library', next);
+      if (item) logAction('library.toggle_deployed', { title: item.title, deployed: !item.deployed });
       return next;
     });
+  };
+
+  // ---- push an article to WordPress as a draft, then mark deployed ----
+  const pushToWordPress = async (item) => {
+    setModal({ type: 'loading', message: `Finding a relevant image for "${item.title}"…` });
+    const categoryLabelMap = {
+      fitness: 'Fitness', nutrition: 'Nutrition', mental_health: 'Mental health',
+      health_guides: 'Health guides', beauty: 'Beauty'
+    };
+
+    // Try to find a featured image via Pexels (non-blocking)
+    let chosenImage = null;
+    const imageQuery = item.imageQuery || item.keyword || item.title;
+    try {
+      const imgRes = await fetch('/api/image', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: imageQuery, orientation: 'landscape', count: 5 }),
+      });
+      if (imgRes.ok) {
+        const imgData = await imgRes.json();
+        if (imgData.photos && imgData.photos.length) {
+          chosenImage = imgData.photos[0];
+        }
+      }
+    } catch {}
+
+    setModal({
+      type: 'loading',
+      message: chosenImage
+        ? `Pushing to WordPress with image by ${chosenImage.photographer}…`
+        : `Pushing "${item.title}" to WordPress as a draft (no image)…`
+    });
+
+    try {
+      const html = mdToHtml(item.content).replace(/^<h1>[\s\S]*?<\/h1>\n?/, '');
+      const res = await fetch('/api/wordpress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: item.title,
+          content: html,
+          excerpt: item.excerpt || '',
+          categoryName: categoryLabelMap[item.category] || item.category,
+          tags: item.tags || [],
+          meta: item.meta || '',
+          imageUrl: chosenImage?.large2x || chosenImage?.url || null,
+          imageAlt: chosenImage?.alt || item.title,
+          imageCredit: chosenImage ? `Photo by ${chosenImage.photographer} on Pexels` : '',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error?.message || `Push failed (${res.status})`);
+      }
+      setLibraryItems(prev => {
+        const next = prev.map(i => i.id === item.id ? {
+          ...i,
+          deployed: true,
+          deployedAt: Date.now(),
+          wpPostId: data.id,
+          wpEditUrl: data.editUrl,
+          wpLink: data.link,
+          featuredImage: chosenImage ? {
+            url: chosenImage.url,
+            thumb: chosenImage.thumb,
+            photographer: chosenImage.photographer,
+            photographerUrl: chosenImage.photographerUrl,
+          } : null,
+        } : i);
+        storage.set('library', next);
+        return next;
+      });
+      setModal(null);
+      const msg = chosenImage
+        ? `Pushed to WordPress with image by ${chosenImage.photographer}`
+        : 'Pushed to WordPress (no image — set PEXELS_API_KEY to auto-add)';
+      logAction('library.push_wp', { title: item.title, wpPostId: data.id, hasImage: !!chosenImage });
+      showToast(msg, 'success');
+    } catch (e) {
+      setModal({ type: 'error', message: e.message });
+    }
   };
 
   // ---- category training save ----
@@ -543,6 +714,7 @@ export default function EditorialDesk() {
         createdAt: Date.now()
       }));
       addTopics(newTopics);
+      logAction('topic.generate', { count: newTopics.length, type, seed });
       setModal(null);
       showToast(`${newTopics.length} topics ready`, 'success');
     } catch (e) {
@@ -569,12 +741,14 @@ export default function EditorialDesk() {
         tags: parsed.tags || [],
         category: parsed.category || topic.category || '',
         cluster: topic.cluster || '',
+        imageQuery: parsed.imageQuery || '',
         content: parsed.content || text,
         status: 'pending',
         createdAt: Date.now()
       };
       addDraft(draft);
       updateTopic(topic.id, { status: 'written', draftId: draft.id });
+      logAction('draft.write', { draftId: draft.id, topicId: topic.id, type: topic.type, title: draft.title });
     } catch (e) {
       updateTopic(topic.id, { status: 'pending', error: e.message });
       showToast(`Write failed: ${e.message.slice(0, 80)}`, 'error');
@@ -785,10 +959,27 @@ Return ONLY a JSON array (no preamble, no fences):
     updateTrainingEvent(parentEventId, { data: { ...parent.data, patches: updatedPatches } });
   };
 
+  // Auth gating
+  if (authStatus.checking) {
+    return (
+      <div style={styles.loading} data-theme={theme}>
+        <style>{globalCss}</style>
+        <Loader2 size={28} style={{ animation: 'spin 1s linear infinite', color: 'var(--c-green)' }} />
+      </div>
+    );
+  }
+  if (!authStatus.hasUsers) {
+    return <SetupScreen theme={theme} onComplete={(user) => setAuthStatus({ checking: false, user, hasUsers: true })} />;
+  }
+  if (!authStatus.user) {
+    return <LoginScreen theme={theme} onLogin={(user) => setAuthStatus({ checking: false, user, hasUsers: true })} />;
+  }
+
   if (!loaded) {
     return (
-      <div style={styles.loading}>
-        <Loader2 size={28} style={{ animation: 'spin 1s linear infinite', color: '#2D5F4E' }} />
+      <div style={styles.loading} data-theme={theme}>
+        <style>{globalCss}</style>
+        <Loader2 size={28} style={{ animation: 'spin 1s linear infinite', color: 'var(--c-green)' }} />
       </div>
     );
   }
@@ -806,12 +997,27 @@ Return ONLY a JSON array (no preamble, no fences):
   };
 
   return (
-    <div style={styles.app}>
+    <div style={styles.app} data-theme={theme}>
       <style>{globalCss}</style>
 
-      <Header view={view} setView={setView} counts={counts} />
+      <Sidebar
+        view={view}
+        setView={setView}
+        counts={counts}
+        currentUser={authStatus.user}
+        theme={theme}
+        onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+        isOpen={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        onLogout={async () => {
+          await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+          setAuthStatus({ checking: false, user: null, hasUsers: true });
+        }}
+      />
 
-      <main style={styles.main}>
+      <div style={styles.mainArea}>
+        <TopBar onMenuClick={() => setSidebarOpen(true)} currentView={view} />
+        <main style={styles.main}>
         {view === 'sitemap' && (
           <SitemapView
             sitePages={sitePages}
@@ -852,6 +1058,7 @@ Return ONLY a JSON array (no preamble, no fences):
             onPublishDraft={publishDraft}
             onRejectDraft={(id) => updateDraft(id, { status: 'rejected' })}
             onDeleteDraft={deleteDraft}
+            canApprove={canApprove}
           />
         )}
 
@@ -862,6 +1069,9 @@ Return ONLY a JSON array (no preamble, no fences):
             onExport={(d) => setModal({ type: 'export', item: d })}
             onDelete={deleteLibraryItem}
             onToggleDeployed={toggleDeployed}
+            onPushToWP={pushToWordPress}
+            wpStatus={wpStatus}
+            canApprove={canApprove}
             showToast={showToast}
           />
         )}
@@ -899,7 +1109,16 @@ Return ONLY a JSON array (no preamble, no fences):
             onSave={async (next) => { setSettings(next); await storage.set('settings', next); showToast('Settings saved', 'success'); }}
           />
         )}
+
+        {view === 'admin' && isAdmin && (
+          <AdminView currentUser={authStatus.user} showToast={showToast} />
+        )}
+
+        {view === 'reports' && isAdmin && (
+          <ReportsView showToast={showToast} />
+        )}
       </main>
+      </div>
 
       {modal && (
         <Modal onClose={() => setModal(null)}>
@@ -1139,6 +1358,7 @@ META: <meta description for SEO, 150–160 chars>
 EXCERPT: <2–3 sentence article teaser>
 TAGS: <comma-separated tags, 4–7 of them>
 CATEGORY: <fitness | nutrition | mental_health | health_guides | beauty>
+IMAGE_QUERY: <4–6 word stock-photo search query — describe a SCENE, not an abstract concept. When subjects are people, prefer "diverse" or "African" or "multi-ethnic" to suit our SA audience. Examples: "diverse women jogging outdoor sunrise", "African mother cooking healthy meal", "young man meditation home", "fresh leafy vegetables market stall">
 
 ---
 
@@ -1153,44 +1373,142 @@ No preamble before TITLE. No commentary after the article.`;
 // HEADER
 // ============================================================================
 
-function Header({ view, setView, counts }) {
-  const tabs = [
-    { id: 'sitemap', label: 'Sitemap', icon: Network, badge: counts.sitemap },
-    { id: 'evergreen', label: 'Evergreen', icon: Sprout, badge: counts.evergreen },
-    { id: 'news', label: 'News', icon: Newspaper, badge: counts.news },
-    { id: 'mythbusting', label: 'Mythbust', icon: Zap, badge: counts.mythbusting },
-    { id: 'library', label: 'Library', icon: Library, badge: counts.library },
-    { id: 'train', label: 'Train', icon: GraduationCap },
-    { id: 'prompts', label: 'Prompts', icon: BookOpen },
-    { id: 'settings', label: 'Style', icon: Settings },
+function Sidebar({ view, setView, counts, currentUser, onLogout, theme, onToggleTheme, isOpen, onClose }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const isAdmin = currentUser?.role === 'admin';
+
+  const sections = [
+    {
+      label: 'Content',
+      items: [
+        { id: 'sitemap', label: 'Sitemap', icon: Network, badge: counts.sitemap },
+      ],
+    },
+    {
+      label: 'Pipeline',
+      items: [
+        { id: 'evergreen', label: 'Evergreen', icon: Sprout, badge: counts.evergreen },
+        { id: 'news', label: 'News', icon: Newspaper, badge: counts.news },
+        { id: 'mythbusting', label: 'Mythbust', icon: Zap, badge: counts.mythbusting },
+        { id: 'library', label: 'Library', icon: Library, badge: counts.library },
+      ],
+    },
+    {
+      label: 'AI',
+      items: [
+        { id: 'train', label: 'Train', icon: GraduationCap },
+        { id: 'prompts', label: 'Prompts', icon: BookOpen },
+        { id: 'settings', label: 'Style', icon: Settings },
+      ],
+    },
+    ...(isAdmin ? [{
+      label: 'Admin',
+      items: [
+        { id: 'admin', label: 'Users', icon: Wand2 },
+        { id: 'reports', label: 'Reports', icon: Beaker },
+      ],
+    }] : []),
   ];
+
+  const roleColor = currentUser?.role === 'admin' ? colors.green
+                  : currentUser?.role === 'editor' ? colors.blue
+                  : colors.ochre;
+
+  const handleNav = (id) => {
+    setView(id);
+    if (onClose) onClose();
+  };
+
   return (
-    <header style={styles.header}>
-      <div style={styles.brand}>
-        <div style={styles.brandMark}>◐</div>
-        <div>
-          <div style={styles.brandTitle}>The Editorial Desk</div>
-          <div style={styles.brandSub}>South African health · workflow</div>
+    <>
+      {/* Mobile backdrop */}
+      {isOpen && <div className="ed-sidebar-backdrop" onClick={onClose} />}
+
+      <aside className={`ed-sidebar${isOpen ? ' is-open' : ''}`} style={styles.sidebar}>
+        <div style={styles.sidebarBrand}>
+          <div style={styles.brandMark}>◐</div>
+          <div>
+            <div style={styles.sidebarBrandTitle}>Editorial Desk</div>
+            <div style={styles.sidebarBrandSub}>SA Health Workflow</div>
+          </div>
         </div>
-      </div>
-      <nav style={styles.nav}>
-        {tabs.map(t => {
-          const Icon = t.icon;
-          const active = view === t.id;
-          return (
-            <button
-              key={t.id}
-              onClick={() => setView(t.id)}
-              style={{ ...styles.navBtn, ...(active ? styles.navBtnActive : {}) }}
-            >
-              <Icon size={15} strokeWidth={1.8} />
-              <span>{t.label}</span>
-              {t.badge > 0 && <span style={styles.badge}>{t.badge}</span>}
-            </button>
-          );
-        })}
-      </nav>
-    </header>
+
+        <nav style={styles.sidebarNav}>
+          {sections.map(section => (
+            <div key={section.label} style={styles.sidebarSection}>
+              <div style={styles.sidebarSectionLabel}>{section.label}</div>
+              {section.items.map(t => {
+                const Icon = t.icon;
+                const active = view === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    onClick={() => handleNav(t.id)}
+                    style={{ ...styles.sidebarItem, ...(active ? styles.sidebarItemActive : {}) }}
+                  >
+                    <Icon size={16} strokeWidth={1.7} />
+                    <span style={styles.sidebarItemLabel}>{t.label}</span>
+                    {t.badge > 0 && <span style={styles.sidebarBadge}>{t.badge}</span>}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
+
+        <div style={styles.sidebarFooter}>
+          <button onClick={onToggleTheme} style={styles.themeToggle}>
+            {theme === 'dark' ? <Sparkles size={14} /> : <Eye size={14} />}
+            <span>{theme === 'dark' ? 'Light' : 'Dark'} mode</span>
+          </button>
+
+          {currentUser && (
+            <div style={{ position: 'relative' }}>
+              <button onClick={() => setMenuOpen(!menuOpen)} style={styles.sidebarUserBtn}>
+                <span style={{ ...styles.userAvatar, background: roleColor }}>
+                  {(currentUser.name || currentUser.username || '?').charAt(0).toUpperCase()}
+                </span>
+                <div style={styles.sidebarUserInfo}>
+                  <div style={styles.sidebarUserName}>{currentUser.name || currentUser.username}</div>
+                  <div style={styles.sidebarUserRole}>{currentUser.role}</div>
+                </div>
+                <ChevronRight size={14} style={{ transform: menuOpen ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s', color: colors.muted }} />
+              </button>
+              {menuOpen && (
+                <div style={styles.userMenuSidebar} onMouseLeave={() => setMenuOpen(false)}>
+                  <button style={styles.menuItem} onClick={() => { setMenuOpen(false); onLogout(); }}>
+                    <ExternalLink size={13} /> Sign out
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function TopBar({ onMenuClick, currentView }) {
+  const viewTitles = {
+    sitemap: 'Sitemap',
+    evergreen: 'Evergreen',
+    news: 'News',
+    mythbusting: 'Mythbust',
+    library: 'Library',
+    train: 'Train',
+    prompts: 'Prompts',
+    settings: 'Style',
+    admin: 'Users',
+    reports: 'Reports',
+  };
+  return (
+    <div className="ed-topbar" style={styles.topBar}>
+      <button onClick={onMenuClick} style={styles.menuToggle} aria-label="Menu">
+        <Menu size={20} />
+      </button>
+      <div style={styles.topBarTitle}>{viewTitles[currentView] || ''}</div>
+    </div>
   );
 }
 
@@ -1201,7 +1519,7 @@ function Header({ view, setView, counts }) {
 function PipelineView({
   type, seed, onSeedChange, topics, drafts,
   onGenerate, onApproveWrite, onRejectTopic, onReinstateTopic, onDeleteTopic,
-  onOpenDraft, onPublishDraft, onRejectDraft, onDeleteDraft
+  onOpenDraft, onPublishDraft, onRejectDraft, onDeleteDraft, canApprove
 }) {
   const [count, setCount] = useState(50);
   const [tab, setTab] = useState('topics');
@@ -1349,6 +1667,7 @@ function PipelineView({
                   onReject={() => onRejectTopic(t.id)}
                   onReinstate={() => onReinstateTopic(t.id)}
                   onDelete={() => onDeleteTopic(t.id)}
+                  canApprove={canApprove}
                 />
               ))}
             </div>
@@ -1387,6 +1706,7 @@ function PipelineView({
                   onPublish={() => onPublishDraft(d)}
                   onReject={() => onRejectDraft(d.id)}
                   onDelete={() => onDeleteDraft(d.id)}
+                  canApprove={canApprove}
                 />
               ))}
             </div>
@@ -1401,7 +1721,7 @@ function PipelineView({
 // TOPIC ROW (compact, expandable)
 // ============================================================================
 
-function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete }) {
+function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete, canApprove = true }) {
   const [expanded, setExpanded] = useState(false);
 
   const statusColor = {
@@ -1438,7 +1758,7 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete }) {
           </div>
         </div>
         <div style={styles.topicRowActions}>
-          {topic.status === 'pending' && (
+          {topic.status === 'pending' && canApprove && (
             <>
               <button style={styles.iconActionBtn} onClick={onReject} title="Reject">
                 <X size={14} />
@@ -1447,6 +1767,11 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete }) {
                 <Check size={14} />
               </button>
             </>
+          )}
+          {topic.status === 'pending' && !canApprove && (
+            <span style={styles.pendingChip}>
+              <Eye size={11} /> awaiting review
+            </span>
           )}
           {isWriting && (
             <div style={styles.writingChip}>
@@ -1530,7 +1855,7 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete }) {
 // DRAFT ROW
 // ============================================================================
 
-function DraftRow({ draft, onView, onPublish, onReject, onDelete }) {
+function DraftRow({ draft, onView, onPublish, onReject, onDelete, canApprove = true }) {
   const wordCount = draft.content.split(/\s+/).filter(Boolean).length;
   const preview = draft.content.replace(/[#*_`>]/g, '').slice(0, 180);
   return (
@@ -1547,7 +1872,7 @@ function DraftRow({ draft, onView, onPublish, onReject, onDelete }) {
         <p style={styles.draftPreview}>{preview}…</p>
       </div>
       <div style={styles.draftActions} onClick={e => e.stopPropagation()}>
-        {draft.status === 'pending' && (
+        {draft.status === 'pending' && canApprove && (
           <>
             <button style={styles.iconActionBtn} onClick={onReject} title="Reject">
               <X size={15} />
@@ -1556,6 +1881,11 @@ function DraftRow({ draft, onView, onPublish, onReject, onDelete }) {
               <Check size={15} />
             </button>
           </>
+        )}
+        {draft.status === 'pending' && !canApprove && (
+          <span style={styles.pendingChip}>
+            <Eye size={11} /> awaiting review
+          </span>
         )}
         <button style={styles.iconActionBtn} onClick={onView} title="Open">
           <ChevronRight size={15} />
@@ -1569,7 +1899,7 @@ function DraftRow({ draft, onView, onPublish, onReject, onDelete }) {
 // LIBRARY
 // ============================================================================
 
-function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, showToast }) {
+function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, onPushToWP, wpStatus, canApprove = true, showToast }) {
   const [filter, setFilter] = useState('all');
   const [deployFilter, setDeployFilter] = useState('all');
   const filtered = items.filter(i => {
@@ -1594,8 +1924,9 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, show
   if (items.length === 0) {
     return (
       <>
-        <PageHead eyebrow="04" title="Library" sub="Approved articles ready to export to WordPress." />
-        <EmptyState icon={Library} title="Nothing in the library yet" hint="Approved drafts land here, ready for WordPress export." />
+        <PageHead eyebrow="04" title="Library" sub="Approved articles ready to publish." />
+        <WpStatusBanner status={wpStatus} />
+        <EmptyState icon={Library} title="Nothing in the library yet" hint="Approved drafts land here, ready to push to WordPress." />
       </>
     );
   }
@@ -1606,6 +1937,7 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, show
   return (
     <>
       <PageHead eyebrow="04" title="Library" sub={`${items.length} finished ${items.length === 1 ? 'article' : 'articles'}.`} />
+      <WpStatusBanner status={wpStatus} />
       <div style={styles.filterRow}>
         {filters.map(f => (
           <button
@@ -1631,6 +1963,14 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, show
       <div style={styles.draftList}>
         {filtered.map(item => (
           <article key={item.id} style={styles.draftRow} onClick={() => onView(item)}>
+            {item.featuredImage?.thumb && (
+              <img
+                src={item.featuredImage.thumb}
+                alt=""
+                style={styles.libraryThumb}
+                title={item.featuredImage.photographer ? `Photo by ${item.featuredImage.photographer}` : ''}
+              />
+            )}
             <div style={styles.draftLeft}>
               <div style={styles.draftMeta}>
                 <span style={{ ...styles.statusDot, background: typeColor(item.type) }} />
@@ -1639,7 +1979,18 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, show
                 <span>{item.category}</span>
                 <span style={styles.cardDot}>·</span>
                 <span>Published {timeAgo(item.publishedAt)}</span>
-                {item.deployed && (
+                {item.deployed && item.wpEditUrl && (
+                  <a
+                    href={item.wpEditUrl}
+                    target="_blank"
+                    rel="noopener"
+                    onClick={e => e.stopPropagation()}
+                    style={{ ...styles.doneChip, textDecoration: 'none' }}
+                  >
+                    <ExternalLink size={11} /> in WordPress
+                  </a>
+                )}
+                {item.deployed && !item.wpEditUrl && (
                   <span style={styles.doneChip}>
                     <Rocket size={11} /> deployed
                   </span>
@@ -1649,14 +2000,34 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, show
               <p style={styles.draftPreview}>{item.excerpt || item.content.replace(/[#*_`>]/g, '').slice(0, 180)}…</p>
             </div>
             <div style={styles.draftActions} onClick={e => e.stopPropagation()}>
-              <button
-                style={{ ...styles.iconActionBtn, ...(item.deployed ? styles.iconActionPrimary : {}) }}
-                onClick={() => onToggleDeployed(item.id)}
-                title={item.deployed ? 'Mark as not deployed' : 'Mark as deployed to live site'}
-              >
-                <Rocket size={15} />
-              </button>
-              <button style={{ ...styles.iconActionBtn, ...styles.iconActionPrimary }} onClick={() => onExport(item)} title="Export to WordPress">
+              {!item.deployed && wpStatus.connected && canApprove && (
+                <button
+                  style={{ ...styles.iconActionBtn, ...styles.iconActionPrimary }}
+                  onClick={() => onPushToWP(item)}
+                  title="Push to WordPress as draft"
+                >
+                  <Rocket size={15} />
+                </button>
+              )}
+              {!item.deployed && !wpStatus.connected && canApprove && (
+                <button
+                  style={styles.iconActionBtn}
+                  onClick={() => onToggleDeployed(item.id)}
+                  title="Mark as deployed manually (WP not connected)"
+                >
+                  <Rocket size={15} />
+                </button>
+              )}
+              {item.deployed && canApprove && (
+                <button
+                  style={styles.iconActionBtn}
+                  onClick={() => onToggleDeployed(item.id)}
+                  title="Mark as not deployed"
+                >
+                  <RotateCcw size={15} />
+                </button>
+              )}
+              <button style={styles.iconActionBtn} onClick={() => onExport(item)} title="Manual export (copy HTML)">
                 <FileCode size={15} />
               </button>
               <button style={styles.iconActionBtn} onClick={() => onDelete(item.id)} title="Delete">
@@ -1667,6 +2038,36 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, show
         ))}
       </div>
     </>
+  );
+}
+
+function WpStatusBanner({ status }) {
+  if (status.checking) {
+    return (
+      <div style={{ ...styles.wpBanner, color: colors.muted }}>
+        <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} />
+        Checking WordPress connection…
+      </div>
+    );
+  }
+  if (status.connected) {
+    return (
+      <div style={{ ...styles.wpBanner, ...styles.wpBannerOk }}>
+        <Check size={13} />
+        Connected to WordPress as <strong style={{ marginLeft: 4 }}>{status.user}</strong> · publishing as drafts to {status.url}
+      </div>
+    );
+  }
+  const reasonText = {
+    env_vars_missing: 'WordPress credentials not set. Add WP_URL, WP_USER, and WP_APP_PASSWORD to your Vercel environment variables. See DEPLOY.md for steps.',
+    auth_failed: 'Authentication failed. Check that WP_USER and WP_APP_PASSWORD are correct and that the user has publishing rights.',
+    fetch_failed: `Could not reach the site. Check WP_URL is correct and reachable. ${status.detail || ''}`,
+  }[status.reason] || 'WordPress not connected. Using manual deploy toggle instead.';
+  return (
+    <div style={{ ...styles.wpBanner, ...styles.wpBannerWarn }}>
+      <AlertCircle size={13} />
+      {reasonText}
+    </div>
   );
 }
 
@@ -2654,6 +3055,540 @@ function ViewPromptPanel({ settings, onClose, showToast }) {
 }
 
 // ============================================================================
+// AUTH SCREENS
+// ============================================================================
+
+function SetupScreen({ onComplete, theme = 'light' }) {
+  const [name, setName] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Load fonts
+  useEffect(() => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..700&family=Instrument+Sans:wght@400;500;600&display=swap';
+    document.head.appendChild(link);
+    return () => { try { document.head.removeChild(link); } catch {} };
+  }, []);
+
+  const submit = async () => {
+    setError(null);
+    if (!name.trim() || !username.trim() || !password) {
+      setError('All fields required'); return;
+    }
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters'); return;
+    }
+    if (password !== confirm) {
+      setError('Passwords do not match'); return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await fetch('/api/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ name: name.trim(), username: username.trim(), password }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data?.error?.message || 'Setup failed'); setSubmitting(false); return; }
+      onComplete(data.user);
+    } catch (e) {
+      setError(e.message); setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={styles.authScreen} data-theme={theme}>
+      <style>{globalCss}</style>
+      <div style={styles.authCard}>
+        <div style={styles.authBrand}>
+          <div style={styles.brandMark}>◐</div>
+          <div>
+            <div style={styles.brandTitle}>The Editorial Desk</div>
+            <div style={styles.brandSub}>First-time setup</div>
+          </div>
+        </div>
+        <h1 style={styles.authTitle}>Create the first admin</h1>
+        <p style={styles.authSub}>This account has full powers — user management, reports, everything. You can add more users from the Admin tab once you're in.</p>
+        <label style={styles.formLabel}>Your name</label>
+        <input value={name} onChange={e => setName(e.target.value)} style={styles.topicInput} placeholder="Lisa Smith" />
+        <label style={styles.formLabel}>Username</label>
+        <input value={username} onChange={e => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))} style={styles.topicInput} placeholder="lisa" autoComplete="username" />
+        <label style={styles.formLabel}>Password <span style={styles.optional}>8+ characters</span></label>
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)} style={styles.topicInput} autoComplete="new-password" />
+        <label style={styles.formLabel}>Confirm password</label>
+        <input type="password" value={confirm} onChange={e => setConfirm(e.target.value)} style={styles.topicInput} autoComplete="new-password" onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
+        {error && <div style={styles.authError}>{error}</div>}
+        <button style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 18, padding: '12px 18px' }} onClick={submit} disabled={submitting}>
+          {submitting ? <Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} /> : <ArrowRight size={15} />}
+          {submitting ? 'Creating…' : 'Create admin account'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LoginScreen({ onLogin, theme = 'light' }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..700&family=Instrument+Sans:wght@400;500;600&display=swap';
+    document.head.appendChild(link);
+    return () => { try { document.head.removeChild(link); } catch {} };
+  }, []);
+
+  const submit = async () => {
+    setError(null);
+    if (!username.trim() || !password) { setError('Username and password required'); return; }
+    setSubmitting(true);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data?.error?.message || 'Login failed'); setSubmitting(false); return; }
+      onLogin(data.user);
+    } catch (e) {
+      setError(e.message); setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={styles.authScreen} data-theme={theme}>
+      <style>{globalCss}</style>
+      <div style={styles.authCard}>
+        <div style={styles.authBrand}>
+          <div style={styles.brandMark}>◐</div>
+          <div>
+            <div style={styles.brandTitle}>The Editorial Desk</div>
+            <div style={styles.brandSub}>South African health · workflow</div>
+          </div>
+        </div>
+        <h1 style={styles.authTitle}>Sign in</h1>
+        <label style={styles.formLabel}>Username</label>
+        <input value={username} onChange={e => setUsername(e.target.value)} style={styles.topicInput} autoComplete="username" autoFocus />
+        <label style={styles.formLabel}>Password</label>
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)} style={styles.topicInput} autoComplete="current-password" onKeyDown={e => { if (e.key === 'Enter') submit(); }} />
+        {error && <div style={styles.authError}>{error}</div>}
+        <button style={{ ...styles.primaryBtn, width: '100%', justifyContent: 'center', marginTop: 18, padding: '12px 18px' }} onClick={submit} disabled={submitting}>
+          {submitting ? <Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} /> : <ArrowRight size={15} />}
+          {submitting ? 'Signing in…' : 'Sign in'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// ADMIN VIEW
+// ============================================================================
+
+function AdminView({ currentUser, showToast }) {
+  const [users, setUsers] = useState(null);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState(null);
+
+  const loadUsers = async () => {
+    try {
+      const res = await fetch('/api/users', { credentials: 'same-origin' });
+      const data = await res.json();
+      if (res.ok) setUsers(data.users);
+      else setError(data?.error?.message || 'Failed to load users');
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  useEffect(() => { loadUsers(); }, []);
+
+  const updateRole = async (id, role) => {
+    try {
+      const res = await fetch(`/api/users/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ role }),
+      });
+      const data = await res.json();
+      if (!res.ok) { showToast(data?.error?.message || 'Failed', 'error'); return; }
+      showToast('Role updated', 'success');
+      loadUsers();
+    } catch (e) { showToast(e.message, 'error'); }
+  };
+
+  const deleteUser = async (id, username) => {
+    if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
+    try {
+      const res = await fetch(`/api/users/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+      const data = await res.json();
+      if (!res.ok) { showToast(data?.error?.message || 'Failed', 'error'); return; }
+      showToast('User deleted', 'success');
+      loadUsers();
+    } catch (e) { showToast(e.message, 'error'); }
+  };
+
+  return (
+    <>
+      <PageHead
+        eyebrow="07 · Admin"
+        title="Users"
+        sub="Add, remove, and manage team members. Roles: admin (everything), editor (write + approve + publish), contributor (write only — cannot approve)."
+        action={
+          <button style={styles.primaryBtn} onClick={() => setCreating(true)}>
+            <Plus size={16} /> Add user
+          </button>
+        }
+      />
+
+      {creating && (
+        <CreateUserForm
+          onCreated={() => { setCreating(false); loadUsers(); showToast('User created', 'success'); }}
+          onCancel={() => setCreating(false)}
+        />
+      )}
+
+      {error && <div style={styles.authError}>{error}</div>}
+
+      {users === null ? (
+        <div style={{ padding: 40, textAlign: 'center' }}>
+          <Loader2 size={22} style={{ animation: 'spin 1s linear infinite', color: '#2D5F4E' }} />
+        </div>
+      ) : (
+        <div style={styles.usersTable}>
+          <div style={{ ...styles.usersRow, ...styles.usersHeader }}>
+            <div style={{ flex: 2 }}>Name</div>
+            <div style={{ flex: 1.5 }}>Username</div>
+            <div style={{ flex: 1.2 }}>Role</div>
+            <div style={{ flex: 1.5 }}>Last login</div>
+            <div style={{ width: 40 }}></div>
+          </div>
+          {users.map(u => (
+            <div key={u.id} style={styles.usersRow}>
+              <div style={{ flex: 2, fontWeight: 500 }}>{u.name}</div>
+              <div style={{ flex: 1.5, color: '#6B6657', fontFamily: 'ui-monospace, monospace', fontSize: 13 }}>{u.username}</div>
+              <div style={{ flex: 1.2 }}>
+                {u.id === currentUser.id ? (
+                  <span style={styles.roleBadge(u.role)}>{u.role} (you)</span>
+                ) : (
+                  <select
+                    value={u.role}
+                    onChange={e => updateRole(u.id, e.target.value)}
+                    style={styles.roleSelect}
+                  >
+                    <option value="admin">admin</option>
+                    <option value="editor">editor</option>
+                    <option value="contributor">contributor</option>
+                  </select>
+                )}
+              </div>
+              <div style={{ flex: 1.5, color: '#6B6657', fontSize: 13 }}>
+                {u.lastLoginAt ? timeAgo(u.lastLoginAt) : 'never'}
+              </div>
+              <div style={{ width: 40, textAlign: 'right' }}>
+                {u.id !== currentUser.id && (
+                  <button style={styles.iconBtn} onClick={() => deleteUser(u.id, u.username)} title="Delete user">
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function CreateUserForm({ onCreated, onCancel }) {
+  const [name, setName] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('contributor');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  const submit = async () => {
+    setError(null);
+    if (!name.trim() || !username.trim() || !password) { setError('All fields required'); return; }
+    if (password.length < 8) { setError('Password must be at least 8 characters'); return; }
+    setSubmitting(true);
+    try {
+      const res = await fetch('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ name: name.trim(), username: username.trim(), password, role }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data?.error?.message || 'Failed'); setSubmitting(false); return; }
+      onCreated();
+    } catch (e) { setError(e.message); setSubmitting(false); }
+  };
+
+  return (
+    <div style={styles.createUserPanel}>
+      <h3 style={{ ...styles.formTitle, fontSize: 22, marginBottom: 14 }}>New user</h3>
+      <div style={styles.createUserGrid}>
+        <div>
+          <label style={styles.formLabel}>Name</label>
+          <input value={name} onChange={e => setName(e.target.value)} style={styles.topicInput} placeholder="Sipho Dlamini" />
+        </div>
+        <div>
+          <label style={styles.formLabel}>Username</label>
+          <input value={username} onChange={e => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))} style={styles.topicInput} placeholder="sipho" />
+        </div>
+        <div>
+          <label style={styles.formLabel}>Temporary password</label>
+          <input type="text" value={password} onChange={e => setPassword(e.target.value)} style={styles.topicInput} placeholder="8+ characters" />
+        </div>
+        <div>
+          <label style={styles.formLabel}>Role</label>
+          <select value={role} onChange={e => setRole(e.target.value)} style={{ ...styles.topicInput, paddingRight: 14 }}>
+            <option value="admin">Admin — full access</option>
+            <option value="editor">Editor — write, approve, publish</option>
+            <option value="contributor">Contributor — write only, no approve</option>
+          </select>
+        </div>
+      </div>
+      {error && <div style={styles.authError}>{error}</div>}
+      <div style={styles.formActions}>
+        <button style={styles.secondaryBtn} onClick={onCancel}>Cancel</button>
+        <button style={styles.primaryBtn} onClick={submit} disabled={submitting}>
+          {submitting ? <Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} /> : <Plus size={15} />}
+          Create user
+        </button>
+      </div>
+      <p style={{ ...styles.formSub, marginTop: 14, marginBottom: 0 }}>
+        Share the username and password with them out-of-band (e.g. via Signal). They can change their password later from their own profile.
+      </p>
+    </div>
+  );
+}
+
+// ============================================================================
+// REPORTS VIEW
+// ============================================================================
+
+function ReportsView({ showToast }) {
+  const [events, setEvents] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [filterUser, setFilterUser] = useState('all');
+  const [filterAction, setFilterAction] = useState('all');
+  const [filterRange, setFilterRange] = useState('30d');
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [evRes, uRes] = await Promise.all([
+          fetch('/api/activity', { credentials: 'same-origin' }),
+          fetch('/api/users', { credentials: 'same-origin' }),
+        ]);
+        const evData = await evRes.json();
+        const uData = await uRes.json();
+        if (evRes.ok) setEvents(evData.events || []);
+        if (uRes.ok) setUsers(uData.users || []);
+        if (!evRes.ok) setError(evData?.error?.message || 'Could not load activity');
+      } catch (e) {
+        setError(e.message);
+      }
+    })();
+  }, []);
+
+  if (events === null) {
+    return (
+      <>
+        <PageHead eyebrow="08 · Reports" title="Reports" sub="Activity log and per-user stats." />
+        <div style={{ padding: 40, textAlign: 'center' }}>
+          <Loader2 size={22} style={{ animation: 'spin 1s linear infinite', color: '#2D5F4E' }} />
+        </div>
+      </>
+    );
+  }
+
+  // Filter
+  const rangeMs = {
+    '24h': 24 * 60 * 60 * 1000,
+    '7d': 7 * 24 * 60 * 60 * 1000,
+    '30d': 30 * 24 * 60 * 60 * 1000,
+    'all': Infinity,
+  }[filterRange];
+  const cutoff = Date.now() - rangeMs;
+
+  const filtered = events.filter(e => {
+    if (e.timestamp < cutoff) return false;
+    if (filterUser !== 'all' && e.userId !== filterUser) return false;
+    if (filterAction !== 'all') {
+      const family = filterAction; // e.g. 'topic', 'draft', 'library'
+      if (!e.action.startsWith(family + '.')) return false;
+    }
+    return true;
+  });
+
+  // Per-user summary
+  const summary = {};
+  filtered.forEach(e => {
+    if (!summary[e.userId]) summary[e.userId] = { username: e.username, name: '', counts: {} };
+    summary[e.userId].counts[e.action] = (summary[e.userId].counts[e.action] || 0) + 1;
+  });
+  // Resolve user names
+  users.forEach(u => { if (summary[u.id]) summary[u.id].name = u.name; });
+
+  const tally = (userSummary, prefix) => Object.entries(userSummary.counts).filter(([k]) => k.startsWith(prefix)).reduce((s, [, n]) => s + n, 0);
+
+  const topicCount = filtered.filter(e => e.action === 'topic.generate').reduce((s, e) => s + (e.metadata?.count || 1), 0);
+  const draftCount = filtered.filter(e => e.action === 'draft.write').length;
+  const approvedCount = filtered.filter(e => e.action === 'draft.approve').length;
+  const pushedCount = filtered.filter(e => e.action === 'library.push_wp').length;
+
+  const actionLabels = {
+    'topic.generate': 'Topics generated',
+    'topic.approve': 'Topic approved',
+    'topic.reject': 'Topic rejected',
+    'draft.write': 'Draft written',
+    'draft.approve': 'Draft approved',
+    'draft.reject': 'Draft rejected',
+    'draft.edit': 'Draft edited',
+    'library.push_wp': 'Pushed to WP',
+    'library.delete': 'Library deleted',
+    'library.toggle_deployed': 'Deploy toggled',
+    'sitemap.add_page': 'Sitemap page added',
+    'sitemap.bulk_add': 'Sitemap bulk add',
+    'user.login': 'Signed in',
+    'user.logout': 'Signed out',
+    'user.create': 'User created',
+    'user.delete': 'User deleted',
+    'user.update': 'User updated',
+    'user.setup': 'Initial setup',
+  };
+
+  return (
+    <>
+      <PageHead
+        eyebrow="08 · Reports"
+        title="Reports"
+        sub="Activity log and per-user stats. Filter by user, time range, or action family."
+      />
+
+      {error && <div style={styles.authError}>{error}</div>}
+
+      {/* Filters */}
+      <div style={styles.reportFilters}>
+        <div>
+          <label style={styles.formLabel}>User</label>
+          <select value={filterUser} onChange={e => setFilterUser(e.target.value)} style={styles.reportSelect}>
+            <option value="all">All users</option>
+            {users.map(u => <option key={u.id} value={u.id}>{u.name} ({u.username})</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={styles.formLabel}>Action</label>
+          <select value={filterAction} onChange={e => setFilterAction(e.target.value)} style={styles.reportSelect}>
+            <option value="all">All actions</option>
+            <option value="topic">Topics</option>
+            <option value="draft">Drafts</option>
+            <option value="library">Library / WordPress</option>
+            <option value="sitemap">Sitemap</option>
+            <option value="user">User / auth</option>
+          </select>
+        </div>
+        <div>
+          <label style={styles.formLabel}>Range</label>
+          <select value={filterRange} onChange={e => setFilterRange(e.target.value)} style={styles.reportSelect}>
+            <option value="24h">Last 24 hours</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+            <option value="all">All time</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Headline stats */}
+      <div style={styles.statsStrip}>
+        <SitemapStat label="Topics generated" value={topicCount} accent="#C77D4A" />
+        <SitemapStat label="Drafts written" value={draftCount} accent="#5B8A78" />
+        <SitemapStat label="Approved" value={approvedCount} accent="#234B3D" />
+        <SitemapStat label="Pushed to WP" value={pushedCount} accent="#1A3D32" />
+        <SitemapStat label="Events" value={filtered.length} />
+      </div>
+
+      {/* Per-user breakdown */}
+      <h2 style={{ ...styles.formTitle, fontSize: 20, marginTop: 32, marginBottom: 12 }}>By user</h2>
+      {Object.keys(summary).length === 0 ? (
+        <EmptyState icon={Beaker} title="No activity in this range" hint="Try widening the filter." />
+      ) : (
+        <div style={styles.usersTable}>
+          <div style={{ ...styles.usersRow, ...styles.usersHeader }}>
+            <div style={{ flex: 1.8 }}>User</div>
+            <div style={{ flex: 1, textAlign: 'right' }}>Topics gen.</div>
+            <div style={{ flex: 1, textAlign: 'right' }}>Drafts written</div>
+            <div style={{ flex: 1, textAlign: 'right' }}>Approved</div>
+            <div style={{ flex: 1, textAlign: 'right' }}>Pushed</div>
+            <div style={{ flex: 0.8, textAlign: 'right' }}>Total</div>
+          </div>
+          {Object.entries(summary)
+            .map(([uid, s]) => {
+              const tg = filtered.filter(e => e.userId === uid && e.action === 'topic.generate').reduce((sum, e) => sum + (e.metadata?.count || 1), 0);
+              const dw = s.counts['draft.write'] || 0;
+              const ap = s.counts['draft.approve'] || 0;
+              const pu = s.counts['library.push_wp'] || 0;
+              const total = Object.values(s.counts).reduce((a, b) => a + b, 0);
+              return { uid, s, tg, dw, ap, pu, total };
+            })
+            .sort((a, b) => b.total - a.total)
+            .map(({ uid, s, tg, dw, ap, pu, total }) => (
+              <div key={uid} style={styles.usersRow}>
+                <div style={{ flex: 1.8 }}>
+                  <div style={{ fontWeight: 500 }}>{s.name || s.username}</div>
+                  <div style={{ fontSize: 11.5, color: '#6B6657' }}>{s.username}</div>
+                </div>
+                <div style={{ flex: 1, textAlign: 'right', fontFamily: 'ui-monospace, monospace' }}>{tg}</div>
+                <div style={{ flex: 1, textAlign: 'right', fontFamily: 'ui-monospace, monospace' }}>{dw}</div>
+                <div style={{ flex: 1, textAlign: 'right', fontFamily: 'ui-monospace, monospace' }}>{ap}</div>
+                <div style={{ flex: 1, textAlign: 'right', fontFamily: 'ui-monospace, monospace' }}>{pu}</div>
+                <div style={{ flex: 0.8, textAlign: 'right', fontWeight: 600 }}>{total}</div>
+              </div>
+            ))}
+        </div>
+      )}
+
+      {/* Recent events timeline */}
+      <h2 style={{ ...styles.formTitle, fontSize: 20, marginTop: 32, marginBottom: 12 }}>Recent events</h2>
+      <div style={styles.eventTimeline}>
+        {filtered.slice(0, 200).map(e => (
+          <div key={e.id} style={styles.eventRow}>
+            <div style={styles.eventTime}>{timeAgo(e.timestamp)}</div>
+            <div style={styles.eventUser}>{e.username}</div>
+            <div style={styles.eventAction}>{actionLabels[e.action] || e.action}</div>
+            <div style={styles.eventMeta}>
+              {e.metadata?.title && <span>"{e.metadata.title.slice(0, 60)}"</span>}
+              {e.metadata?.count && <span> · {e.metadata.count}</span>}
+              {e.metadata?.type && <span> · {e.metadata.type}</span>}
+              {e.metadata?.role && <span> · {e.metadata.role}</span>}
+              {e.metadata?.newUsername && <span> · {e.metadata.newUsername}</span>}
+            </div>
+          </div>
+        ))}
+        {filtered.length === 0 && <EmptyState icon={Beaker} title="No events" hint="Filter is too narrow." />}
+      </div>
+    </>
+  );
+}
+
+// ============================================================================
 // SITEMAP / TOPICAL AUTHORITY
 // ============================================================================
 
@@ -2858,12 +3793,12 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
                   </button>
                   <h3 style={styles.clusterTitle}>{clusterName}</h3>
                   <div style={styles.clusterMeta}>
-                    {buckets.live.length > 0 && <span style={{ ...styles.clusterChip, background: '#E3EAEE', color: '#3A5266' }}>{buckets.live.length} live</span>}
-                    {buckets.planned.length > 0 && <span style={{ ...styles.clusterChip, background: '#F4E4D2', color: '#9C5E2C' }}>{buckets.planned.length} planned</span>}
-                    {buckets.writing.length > 0 && <span style={{ ...styles.clusterChip, background: '#F5E6C5', color: '#8A6628' }}>{buckets.writing.length} writing</span>}
-                    {buckets.drafting.length > 0 && <span style={{ ...styles.clusterChip, background: '#E5EFE9', color: '#2D5F4E' }}>{buckets.drafting.length} draft</span>}
-                    {buckets.ready.length > 0 && <span style={{ ...styles.clusterChip, background: '#D6E3DC', color: '#234B3D' }}>{buckets.ready.length} ready</span>}
-                    {buckets.deployed.length > 0 && <span style={{ ...styles.clusterChip, background: '#C2D3CB', color: '#1A3D32' }}>{buckets.deployed.length} deployed</span>}
+                    {buckets.live.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-blue-bg)', color: 'var(--c-blue)' }}>{buckets.live.length} live</span>}
+                    {buckets.planned.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-ochre-bg)', color: 'var(--c-ochre)' }}>{buckets.planned.length} planned</span>}
+                    {buckets.writing.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-warning-bg)', color: 'var(--c-warning-text)' }}>{buckets.writing.length} writing</span>}
+                    {buckets.drafting.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-green-bg)', color: 'var(--c-green)' }}>{buckets.drafting.length} draft</span>}
+                    {buckets.ready.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-green-bg)', color: 'var(--c-green-deep)' }}>{buckets.ready.length} ready</span>}
+                    {buckets.deployed.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-green-bg)', color: 'var(--c-green-deep)' }}>{buckets.deployed.length} deployed</span>}
                     <span style={styles.clusterTotal}>{total} {total === 1 ? 'page' : 'pages'}</span>
                   </div>
                 </header>
@@ -3079,28 +4014,136 @@ const globalCss = `
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
+  @keyframes slideInLeft { from { transform: translateX(-12px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+  :root {
+    --c-bg: #FAF7F2;
+    --c-surface: #FFFFFF;
+    --c-sidebar: #F2EDE3;
+    --c-ink: #1A1815;
+    --c-ink-soft: #3D3A33;
+    --c-muted: #6B6657;
+    --c-faint: #9A9486;
+    --c-border: #E0D9C9;
+    --c-border-soft: #EDE8DD;
+    --c-green: #2D5F4E;
+    --c-green-deep: #234B3D;
+    --c-green-bg: #EAF1ED;
+    --c-ochre: #C77D4A;
+    --c-ochre-bg: #F4E4D2;
+    --c-red: #A14438;
+    --c-red-bg: #F5E0DD;
+    --c-blue: #3A5266;
+    --c-blue-bg: #E3EAEE;
+    --c-warning-bg: #F5EFE4;
+    --c-warning-border: #E8D9B8;
+    --c-warning-text: #7A5519;
+    --c-success-bg: #EAF1ED;
+    --c-success-border: #C2D8C9;
+    --c-success-text: #1F4636;
+    --c-error-text: #7A2418;
+    --c-code-bg: #1A1815;
+    --c-code-text: #E8E2D7;
+    --c-shadow: rgba(26, 24, 21, 0.06);
+    --c-shadow-strong: rgba(26, 24, 21, 0.15);
+    --c-overlay: rgba(26, 24, 21, 0.45);
+    --c-button-active-bg: #1A1815;
+    --c-button-active-text: #FAF7F2;
+    --c-input-bg: #FAF7F2;
+  }
+
+  [data-theme="dark"] {
+    --c-bg: #0E1218;
+    --c-surface: #161B23;
+    --c-sidebar: #0A0E13;
+    --c-ink: #E8ECF1;
+    --c-ink-soft: #C5CBD3;
+    --c-muted: #8B939E;
+    --c-faint: #5B6471;
+    --c-border: #232932;
+    --c-border-soft: #1A1F27;
+    --c-green: #5BB89A;
+    --c-green-deep: #4A9C82;
+    --c-green-bg: #1A2A23;
+    --c-ochre: #E89968;
+    --c-ochre-bg: #2E2118;
+    --c-red: #E5685B;
+    --c-red-bg: #2E1A18;
+    --c-blue: #7BA3C7;
+    --c-blue-bg: #1A2329;
+    --c-warning-bg: #2A220F;
+    --c-warning-border: #3D3415;
+    --c-warning-text: #D4B574;
+    --c-success-bg: #15241D;
+    --c-success-border: #213029;
+    --c-success-text: #7DC8A8;
+    --c-error-text: #F4A299;
+    --c-code-bg: #050709;
+    --c-code-text: #C5CBD3;
+    --c-shadow: rgba(0, 0, 0, 0.4);
+    --c-shadow-strong: rgba(0, 0, 0, 0.6);
+    --c-overlay: rgba(0, 0, 0, 0.65);
+    --c-button-active-bg: #E8ECF1;
+    --c-button-active-text: #0E1218;
+    --c-input-bg: #0A0E13;
+  }
+
   * { box-sizing: border-box; }
-  body { margin: 0; }
-  textarea, input { font-family: inherit; }
-  textarea:focus, input:focus { outline: none; border-color: #2D5F4E !important; }
+  body { margin: 0; background: var(--c-bg); color: var(--c-ink); }
+  textarea, input, select { font-family: inherit; color: var(--c-ink); background: var(--c-input-bg); }
+  textarea:focus, input:focus, select:focus { outline: none; border-color: var(--c-green) !important; }
   button { cursor: pointer; font-family: inherit; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
+  ::selection { background: var(--c-green); color: var(--c-bg); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--c-border); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--c-muted); }
+
+  /* Sidebar layout — mobile responsive */
+  .ed-sidebar-backdrop {
+    position: fixed; inset: 0; background: var(--c-overlay);
+    z-index: 25; backdrop-filter: blur(2px); animation: fadeIn 0.18s ease;
+  }
+  @media (max-width: 960px) {
+    .ed-sidebar {
+      transform: translateX(-100%);
+      box-shadow: 0 0 0 transparent;
+    }
+    .ed-sidebar.is-open {
+      transform: translateX(0);
+      box-shadow: 8px 0 32px var(--c-shadow-strong);
+    }
+    .ed-topbar { display: flex !important; }
+    div[style*="margin-left: 232"] { margin-left: 0 !important; }
+  }
+  @media (min-width: 961px) {
+    .ed-sidebar-backdrop { display: none; }
+  }
 `;
 
 const colors = {
-  bg: '#FAF7F2',
-  surface: '#FFFFFF',
-  ink: '#1A1815',
-  inkSoft: '#3D3A33',
-  muted: '#6B6657',
-  faint: '#9A9486',
-  border: '#E0D9C9',
-  borderSoft: '#EDE8DD',
-  green: '#2D5F4E',
-  greenDeep: '#234B3D',
-  ochre: '#C77D4A',
-  red: '#A14438',
-  blue: '#3A5266',
+  bg: 'var(--c-bg)',
+  surface: 'var(--c-surface)',
+  sidebar: 'var(--c-sidebar)',
+  ink: 'var(--c-ink)',
+  inkSoft: 'var(--c-ink-soft)',
+  muted: 'var(--c-muted)',
+  faint: 'var(--c-faint)',
+  border: 'var(--c-border)',
+  borderSoft: 'var(--c-border-soft)',
+  green: 'var(--c-green)',
+  greenDeep: 'var(--c-green-deep)',
+  greenBg: 'var(--c-green-bg)',
+  ochre: 'var(--c-ochre)',
+  ochreBg: 'var(--c-ochre-bg)',
+  red: 'var(--c-red)',
+  redBg: 'var(--c-red-bg)',
+  blue: 'var(--c-blue)',
+  blueBg: 'var(--c-blue-bg)',
+  buttonActiveBg: 'var(--c-button-active-bg)',
+  buttonActiveText: 'var(--c-button-active-text)',
+  inputBg: 'var(--c-input-bg)',
 };
 
 const fonts = {
@@ -3111,28 +4154,145 @@ const fonts = {
 const styles = {
   app: { minHeight: '100vh', background: colors.bg, color: colors.ink, fontFamily: fonts.body, fontSize: 15, lineHeight: 1.55 },
   loading: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.bg },
-  header: {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-    padding: '22px 38px', borderBottom: `1px solid ${colors.border}`,
-    background: colors.bg, position: 'sticky', top: 0, zIndex: 10,
-    backdropFilter: 'blur(8px)', flexWrap: 'wrap', gap: 16,
+
+  // === SIDEBAR LAYOUT ===
+  sidebar: {
+    width: 232,
+    background: colors.sidebar,
+    borderRight: `1px solid ${colors.border}`,
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    bottom: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    zIndex: 30,
+    transition: 'transform 0.22s ease',
   },
-  brand: { display: 'flex', alignItems: 'center', gap: 14 },
-  brandMark: { fontSize: 28, fontFamily: fonts.display, color: colors.green, lineHeight: 1, marginTop: -2 },
-  brandTitle: { fontFamily: fonts.display, fontSize: 20, fontWeight: 500, letterSpacing: '-0.01em', lineHeight: 1.1 },
+  sidebarBrand: {
+    display: 'flex', alignItems: 'center', gap: 11,
+    padding: '20px 18px 16px',
+    borderBottom: `1px solid ${colors.borderSoft}`,
+  },
+  sidebarBrandTitle: { fontFamily: fonts.display, fontSize: 16, fontWeight: 500, letterSpacing: '-0.012em', lineHeight: 1.1, color: colors.ink },
+  sidebarBrandSub: { fontSize: 10, color: colors.muted, letterSpacing: '0.1em', textTransform: 'uppercase', marginTop: 3, fontWeight: 500 },
+
+  sidebarNav: { flex: 1, overflowY: 'auto', padding: '12px 10px' },
+  sidebarSection: { marginBottom: 18 },
+  sidebarSectionLabel: {
+    fontSize: 10,
+    letterSpacing: '0.12em',
+    textTransform: 'uppercase',
+    color: colors.faint,
+    fontWeight: 600,
+    padding: '6px 12px 4px',
+    marginBottom: 2,
+  },
+  sidebarItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 11,
+    width: '100%',
+    padding: '8px 12px',
+    background: 'transparent',
+    border: 'none',
+    borderRadius: 6,
+    color: colors.inkSoft,
+    fontSize: 13.5,
+    fontWeight: 500,
+    fontFamily: fonts.body,
+    textAlign: 'left',
+    transition: 'background 0.12s',
+    marginBottom: 1,
+  },
+  sidebarItemActive: {
+    background: colors.buttonActiveBg,
+    color: colors.buttonActiveText,
+  },
+  sidebarItemLabel: { flex: 1 },
+  sidebarBadge: {
+    background: colors.ochre,
+    color: '#FFFFFF',
+    fontSize: 10,
+    fontWeight: 600,
+    padding: '1px 7px',
+    borderRadius: 999,
+    minWidth: 18,
+    textAlign: 'center',
+    letterSpacing: '0.02em',
+  },
+
+  sidebarFooter: {
+    padding: '12px 10px 14px',
+    borderTop: `1px solid ${colors.borderSoft}`,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+  },
+  themeToggle: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    width: '100%', padding: '8px 12px',
+    background: 'transparent', border: `1px solid ${colors.border}`,
+    borderRadius: 6, color: colors.inkSoft, fontSize: 12.5, fontWeight: 500,
+    fontFamily: fonts.body,
+  },
+  sidebarUserBtn: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    width: '100%', padding: 8,
+    background: 'transparent', border: `1px solid ${colors.border}`,
+    borderRadius: 6, fontFamily: fonts.body, color: colors.ink,
+  },
+  sidebarUserInfo: { flex: 1, minWidth: 0, textAlign: 'left' },
+  sidebarUserName: { fontSize: 13, fontWeight: 500, lineHeight: 1.2, overflow: 'hidden', textOverflow: 'ellipsis' },
+  sidebarUserRole: { fontSize: 10.5, color: colors.muted, textTransform: 'capitalize', marginTop: 2, letterSpacing: '0.04em' },
+  userMenuSidebar: {
+    position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 6px)',
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 6, padding: 4, zIndex: 5,
+    boxShadow: `0 8px 24px ${colors.surface === '#FFFFFF' ? 'rgba(0,0,0,0.08)' : 'rgba(0,0,0,0.4)'}`,
+  },
+
+  brand: { display: 'flex', alignItems: 'center', gap: 14 }, // kept for auth screens
+  brandMark: { fontSize: 24, fontFamily: fonts.display, color: colors.green, lineHeight: 1 },
+  brandTitle: { fontFamily: fonts.display, fontSize: 20, fontWeight: 500, letterSpacing: '-0.01em', lineHeight: 1.1, color: colors.ink },
   brandSub: { fontSize: 11, color: colors.muted, letterSpacing: '0.08em', textTransform: 'uppercase', marginTop: 3, fontWeight: 500 },
-  nav: { display: 'flex', gap: 4 },
-  navBtn: { display: 'flex', alignItems: 'center', gap: 7, padding: '8px 14px', border: 'none', background: 'transparent', color: colors.muted, fontSize: 13.5, fontWeight: 500, borderRadius: 8, transition: 'all 0.15s', fontFamily: fonts.body },
-  navBtnActive: { background: colors.ink, color: colors.bg },
-  badge: { background: colors.ochre, color: colors.bg, fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 8, lineHeight: 1.5, letterSpacing: '0.02em' },
-  main: { maxWidth: 1180, margin: '0 auto', padding: '40px 38px 80px' },
+
+  mainArea: {
+    marginLeft: 232,
+    minHeight: '100vh',
+    display: 'flex',
+    flexDirection: 'column',
+    background: colors.bg,
+  },
+  topBar: {
+    display: 'none', // shown on mobile only via CSS
+    alignItems: 'center',
+    gap: 12,
+    padding: '14px 20px',
+    borderBottom: `1px solid ${colors.border}`,
+    background: colors.bg,
+    position: 'sticky',
+    top: 0,
+    zIndex: 20,
+  },
+  menuToggle: {
+    background: 'transparent', border: `1px solid ${colors.border}`,
+    borderRadius: 6, padding: '7px 8px', color: colors.ink,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+  },
+  topBarTitle: { fontFamily: fonts.display, fontSize: 18, fontWeight: 500, letterSpacing: '-0.015em', color: colors.ink },
+
+  main: { maxWidth: 1180, margin: '0 auto', padding: '40px 38px 80px', width: '100%' },
+
+  // legacy header (unused but kept for auth screens that look like cards)
+  badge: { background: colors.ochre, color: '#FFFFFF', fontSize: 10, fontWeight: 600, padding: '1px 6px', borderRadius: 8, lineHeight: 1.5, letterSpacing: '0.02em' },
 
   pageHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 28, gap: 24, flexWrap: 'wrap' },
   eyebrow: { fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: colors.muted, fontWeight: 500, marginBottom: 8 },
   pageTitle: { fontFamily: fonts.display, fontSize: 44, fontWeight: 400, letterSpacing: '-0.025em', lineHeight: 1, margin: 0, fontVariationSettings: '"opsz" 144' },
   pageSub: { fontSize: 15, color: colors.muted, marginTop: 10, maxWidth: 520, lineHeight: 1.5 },
 
-  primaryBtn: { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 18px', background: colors.ink, color: colors.bg, border: 'none', borderRadius: 999, fontSize: 13.5, fontWeight: 500, letterSpacing: '-0.005em', transition: 'all 0.15s' },
+  primaryBtn: { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 18px', background: colors.buttonActiveBg, color: colors.buttonActiveText, border: 'none', borderRadius: 999, fontSize: 13.5, fontWeight: 500, letterSpacing: '-0.005em', transition: 'all 0.15s' },
   secondaryBtn: { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 18px', background: 'transparent', color: colors.ink, border: `1px solid ${colors.border}`, borderRadius: 999, fontSize: 13.5, fontWeight: 500 },
 
   topicBar: { background: colors.surface, padding: '20px 24px', borderRadius: 6, border: `1px solid ${colors.border}`, marginBottom: 24 },
@@ -3141,7 +4301,7 @@ const styles = {
   topicInputLabel: { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.1em', color: colors.muted, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 },
   topicInput: { padding: '11px 14px', fontSize: 15, border: `1px solid ${colors.border}`, borderRadius: 4, fontFamily: fonts.body, background: colors.bg, color: colors.ink },
   countWrap: { flex: '0 1 200px', display: 'flex', flexDirection: 'column', gap: 6 },
-  countBadgeInline: { background: colors.ink, color: colors.bg, padding: '1px 7px', borderRadius: 999, fontSize: 10, fontWeight: 500, letterSpacing: 0, textTransform: 'none', marginLeft: 'auto' },
+  countBadgeInline: { background: colors.buttonActiveBg, color: colors.buttonActiveText, padding: '1px 7px', borderRadius: 999, fontSize: 10, fontWeight: 500, letterSpacing: 0, textTransform: 'none', marginLeft: 'auto' },
 
   subTabRow: { display: 'flex', gap: 4, marginBottom: 20, borderBottom: `1px solid ${colors.borderSoft}` },
   subTab: { display: 'inline-flex', alignItems: 'center', gap: 8, padding: '11px 16px', background: 'transparent', border: 'none', borderBottom: '2px solid transparent', fontSize: 14, color: colors.muted, fontWeight: 500, marginBottom: -1 },
@@ -3150,7 +4310,7 @@ const styles = {
 
   filterRow: { display: 'flex', gap: 6, marginBottom: 18, flexWrap: 'wrap' },
   filterBtn: { padding: '6px 14px', background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 999, fontSize: 12.5, color: colors.muted, fontWeight: 500, display: 'inline-flex', alignItems: 'center', gap: 7 },
-  filterBtnActive: { background: colors.ink, color: colors.bg, borderColor: colors.ink },
+  filterBtnActive: { background: colors.buttonActiveBg, color: colors.buttonActiveText, borderColor: colors.buttonActiveBg },
   filterCount: { fontSize: 11, opacity: 0.65 },
 
   // Dense topic list
@@ -3172,7 +4332,7 @@ const styles = {
   cardEffort: { textTransform: 'capitalize' },
   kwTag: { background: colors.bg, color: colors.muted, padding: '1px 7px', borderRadius: 3, fontSize: 11, border: `1px solid ${colors.borderSoft}` },
   topicRowActions: { display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 },
-  writingChip: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 11px', background: '#EAF1ED', color: colors.green, fontSize: 11.5, fontWeight: 500, borderRadius: 999, textTransform: 'lowercase', letterSpacing: '0.02em' },
+  writingChip: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 11px', background: 'var(--c-green-bg)', color: colors.green, fontSize: 11.5, fontWeight: 500, borderRadius: 999, textTransform: 'lowercase', letterSpacing: '0.02em' },
   doneChip: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', background: colors.green, color: colors.bg, fontSize: 11.5, fontWeight: 500, borderRadius: 999, letterSpacing: '0.02em' },
   topicExpand: { padding: '0 16px 14px 38px', borderTop: `1px solid ${colors.borderSoft}`, paddingTop: 12, marginTop: 0 },
   expandRow: { display: 'flex', gap: 12, marginBottom: 7, fontSize: 13 },
@@ -3214,8 +4374,8 @@ const styles = {
   emptyTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.015em' },
   emptyHint: { fontSize: 14, color: colors.muted, maxWidth: 360 },
 
-  modalOverlay: { position: 'fixed', inset: 0, background: 'rgba(26, 24, 21, 0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20, animation: 'fadeIn 0.18s ease', backdropFilter: 'blur(4px)' },
-  modalBox: { background: colors.bg, borderRadius: 6, maxWidth: 760, width: '100%', maxHeight: '92vh', overflow: 'auto', border: `1px solid ${colors.border}`, boxShadow: '0 20px 60px rgba(0,0,0,0.15)' },
+  modalOverlay: { position: 'fixed', inset: 0, background: 'var(--c-overlay)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20, animation: 'fadeIn 0.18s ease', backdropFilter: 'blur(4px)' },
+  modalBox: { background: colors.bg, borderRadius: 6, maxWidth: 760, width: '100%', maxHeight: '92vh', overflow: 'auto', border: `1px solid ${colors.border}`, boxShadow: '0 20px 60px var(--c-shadow-strong)' },
   formPanel: { padding: '32px 36px' },
   formTitle: { fontFamily: fonts.display, fontSize: 28, fontWeight: 500, letterSpacing: '-0.022em', margin: '0 0 8px', fontVariationSettings: '"opsz" 96' },
   formSub: { fontSize: 14, color: colors.muted, margin: '0 0 24px' },
@@ -3240,8 +4400,8 @@ const styles = {
   exportFieldValue: { flex: 1, fontSize: 13, color: colors.inkSoft, lineHeight: 1.4, wordBreak: 'break-word' },
   exportFieldMulti: { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
   exportTabRow: { display: 'flex', gap: 2, marginBottom: 0, borderBottom: `1px solid ${colors.borderSoft}` },
-  codePanel: { background: colors.ink, borderRadius: 4, marginTop: -1, marginBottom: 14, maxHeight: 280, overflow: 'auto' },
-  codeBlock: { color: '#E8E2D7', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.55, padding: '16px 18px', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+  codePanel: { background: 'var(--c-code-bg)', borderRadius: 4, marginTop: -1, marginBottom: 14, maxHeight: 280, overflow: 'auto' },
+  codeBlock: { color: 'var(--c-code-text)', fontFamily: 'ui-monospace, monospace', fontSize: 12, lineHeight: 1.55, padding: '16px 18px', margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
   exportHint: { fontSize: 12.5, color: colors.muted, lineHeight: 1.5, padding: '10px 14px', background: '#F5EFE4', borderRadius: 4, marginBottom: 14, border: `1px solid ${colors.border}` },
 
   loadingPanel: { padding: '48px 36px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14 },
@@ -3249,7 +4409,7 @@ const styles = {
   loadingSub: { fontSize: 13, color: colors.muted, margin: '0 0 12px' },
   errorDetail: { fontSize: 12.5, color: colors.inkSoft, background: colors.surface, padding: '12px 14px', borderRadius: 4, border: `1px solid ${colors.border}`, maxWidth: 560, width: '100%', textAlign: 'left', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'ui-monospace, monospace', lineHeight: 1.5, margin: '0 0 4px' },
 
-  toast: { position: 'fixed', bottom: 28, left: '50%', transform: 'translateX(-50%)', background: colors.ink, color: colors.bg, padding: '10px 20px', borderRadius: 999, fontSize: 13.5, fontWeight: 500, zIndex: 100, animation: 'fadeIn 0.2s ease', boxShadow: '0 8px 24px rgba(0,0,0,0.12)' },
+  toast: { position: 'fixed', bottom: 28, left: '50%', transform: 'translateX(-50%)', background: colors.buttonActiveBg, color: colors.buttonActiveText, padding: '10px 20px', borderRadius: 999, fontSize: 13.5, fontWeight: 500, zIndex: 100, animation: 'fadeIn 0.2s ease', boxShadow: '0 8px 24px var(--c-shadow-strong)' },
   toastSuccess: { background: colors.green },
   toastError: { background: colors.red },
 
@@ -3286,7 +4446,7 @@ const styles = {
   feedbackOpenBtn: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 12px', background: 'transparent', border: `1px dashed ${colors.border}`, borderRadius: 4, fontSize: 13, color: colors.muted, fontWeight: 500 },
   patchList: { display: 'flex', flexDirection: 'column', gap: 10, marginTop: 12 },
   patchCard: { background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '14px 16px', borderLeftWidth: 3, borderLeftColor: colors.ochre },
-  patchCardApplied: { borderLeftColor: colors.green, background: '#EAF1ED' },
+  patchCardApplied: { borderLeftColor: colors.green, background: 'var(--c-green-bg)' },
   patchHeader: { marginBottom: 8 },
   patchBadge: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 9px', background: colors.surface, color: colors.ochre, fontSize: 10.5, fontWeight: 600, borderRadius: 999, textTransform: 'uppercase', letterSpacing: '0.06em', border: `1px solid ${colors.border}` },
   patchBadgeApplied: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 9px', background: colors.green, color: colors.bg, fontSize: 10.5, fontWeight: 600, borderRadius: 999, textTransform: 'uppercase', letterSpacing: '0.06em' },
@@ -3299,7 +4459,7 @@ const styles = {
   select: { width: '100%', padding: '11px 14px', fontSize: 14, border: `1px solid ${colors.border}`, borderRadius: 4, fontFamily: fonts.body, background: colors.surface, color: colors.ink, marginBottom: 4 },
   segmented: { display: 'flex', gap: 4, flexWrap: 'wrap' },
   segmentedBtn: { padding: '7px 14px', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 999, fontSize: 13, color: colors.inkSoft, fontWeight: 500 },
-  segmentedBtnActive: { background: colors.ink, color: colors.bg, borderColor: colors.ink },
+  segmentedBtnActive: { background: colors.buttonActiveBg, color: colors.buttonActiveText, borderColor: colors.buttonActiveBg },
   topicPreview: { background: colors.surface, padding: '14px 16px', borderRadius: 4, border: `1px solid ${colors.border}` },
   topicPreviewLabel: { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.1em', color: colors.muted, fontWeight: 600, marginBottom: 6 },
   topicPreviewAngle: { fontSize: 13.5, color: colors.inkSoft, lineHeight: 1.5, fontStyle: 'italic', fontFamily: fonts.display },
@@ -3313,7 +4473,7 @@ const styles = {
   mdLi: { margin: '0 0 6px', lineHeight: 1.6, color: colors.inkSoft },
   mdLink: { color: colors.green, textDecoration: 'underline', textDecorationThickness: 1, textUnderlineOffset: 2 },
   mdCode: { fontFamily: 'ui-monospace, monospace', fontSize: 13, background: colors.bg, padding: '1px 5px', borderRadius: 3, color: colors.ink },
-  mdBlockquote: { margin: '14px 0', padding: '12px 18px', borderLeft: `3px solid ${colors.green}`, background: colors.bg, fontStyle: 'italic', color: colors.inkSoft, borderRadius: 2 },
+  mdBlockquote: { margin: '14px 0', padding: '12px 18px', borderLeft: `3px solid ${colors.green}`, background: 'var(--c-input-bg)', fontStyle: 'italic', color: colors.inkSoft, borderRadius: 2 },
 
   // Sitemap / topical authority
   statsStrip: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 1, background: colors.border, border: `1px solid ${colors.border}`, borderRadius: 6, overflow: 'hidden', marginBottom: 28 },
@@ -3342,7 +4502,7 @@ const styles = {
   sitemapControls: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, marginBottom: 20, flexWrap: 'wrap' },
   viewToggle: { display: 'flex', gap: 2, background: colors.surface, padding: 3, borderRadius: 999, border: `1px solid ${colors.border}` },
   viewToggleBtn: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 14px', background: 'transparent', border: 'none', borderRadius: 999, fontSize: 12.5, color: colors.muted, fontWeight: 500, fontFamily: fonts.body },
-  viewToggleBtnActive: { background: colors.ink, color: colors.bg },
+  viewToggleBtnActive: { background: colors.buttonActiveBg, color: colors.buttonActiveText },
   legend: { display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 11, color: colors.muted },
   legendItem: { display: 'inline-flex', alignItems: 'center', gap: 5 },
   legendDot: { width: 8, height: 8, borderRadius: '50%', display: 'inline-block' },
@@ -3366,10 +4526,58 @@ const styles = {
   catTrainBody: { borderTop: `1px solid ${colors.borderSoft}`, padding: '18px 22px 22px' },
   catTabs: { display: 'flex', gap: 4, marginBottom: 16, flexWrap: 'wrap' },
   catTab: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 999, fontSize: 13, color: colors.inkSoft, fontWeight: 500, fontFamily: fonts.body },
-  catTabActive: { background: colors.ink, color: colors.bg, borderColor: colors.ink },
+  catTabActive: { background: colors.buttonActiveBg, color: colors.buttonActiveText, borderColor: colors.buttonActiveBg },
   catDirtyDot: { width: 6, height: 6, borderRadius: '50%', background: colors.ochre, display: 'inline-block' },
   catEditorWrap: {},
   catEditorTopBar: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 10, flexWrap: 'wrap' },
   catTrainHint: { fontSize: 12, color: colors.muted, fontStyle: 'italic' },
   catTrainArea: { width: '100%', padding: 14, fontSize: 13.5, lineHeight: 1.6, border: `1px solid ${colors.border}`, borderRadius: 4, fontFamily: fonts.body, background: colors.bg, resize: 'vertical', color: colors.inkSoft, minHeight: 280 },
+
+  // WordPress connection banner
+  wpBanner: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', borderRadius: 4, fontSize: 12.5, marginBottom: 16, background: colors.surface, border: `1px solid ${colors.border}`, color: colors.muted, lineHeight: 1.45 },
+  wpBannerOk: { background: 'var(--c-success-bg)', borderColor: 'var(--c-success-border)', color: 'var(--c-success-text)' },
+  wpBannerWarn: { background: 'var(--c-warning-bg)', borderColor: 'var(--c-warning-border)', color: 'var(--c-warning-text)' },
+
+  // Featured image thumbnail in library
+  libraryThumb: { width: 72, height: 72, objectFit: 'cover', borderRadius: 4, flexShrink: 0, marginRight: 4 },
+
+  // Auth screens
+  authScreen: { minHeight: '100vh', background: colors.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, color: colors.ink, fontFamily: fonts.body, fontSize: 15 },
+  authCard: { background: colors.surface, padding: '40px 44px', border: `1px solid ${colors.border}`, borderRadius: 8, maxWidth: 440, width: '100%', boxShadow: '0 8px 32px var(--c-shadow)' },
+  authBrand: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 },
+  authTitle: { fontFamily: fonts.display, fontSize: 34, fontWeight: 400, letterSpacing: '-0.025em', lineHeight: 1.05, margin: '0 0 6px', fontVariationSettings: '"opsz" 144' },
+  authSub: { fontSize: 13.5, color: colors.muted, marginBottom: 22, lineHeight: 1.5 },
+  authError: { padding: '10px 14px', background: 'var(--c-red-bg)', color: 'var(--c-error-text)', borderRadius: 4, fontSize: 13, marginTop: 16, border: `1px solid var(--c-red-bg)` },
+
+  // User menu in header
+  userBtn: { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px 6px 6px', background: 'transparent', border: `1px solid ${colors.border}`, borderRadius: 999, fontFamily: fonts.body, color: colors.ink, fontSize: 13.5 },
+  userAvatar: { width: 24, height: 24, borderRadius: '50%', color: '#FFFFFF', fontSize: 12, fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  userName: { fontWeight: 500 },
+  userMenu: { position: 'absolute', right: 0, top: 'calc(100% + 6px)', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, padding: 4, minWidth: 180, zIndex: 20, boxShadow: '0 8px 24px rgba(0,0,0,0.08)' },
+  userMenuHeader: { padding: '10px 12px 8px', borderBottom: `1px solid ${colors.borderSoft}`, marginBottom: 4 },
+  userMenuName: { fontWeight: 500, fontSize: 13.5 },
+  userMenuRole: { fontSize: 11, color: colors.muted, textTransform: 'capitalize', marginTop: 2, letterSpacing: '0.04em' },
+
+  // Pending chip (for contributors)
+  pendingChip: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', background: colors.bg, color: colors.muted, fontSize: 11, fontWeight: 500, borderRadius: 999, border: `1px solid ${colors.borderSoft}`, letterSpacing: '0.02em', fontStyle: 'italic' },
+
+  // Admin / users table
+  usersTable: { display: 'flex', flexDirection: 'column', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, overflow: 'hidden' },
+  usersRow: { display: 'flex', alignItems: 'center', gap: 14, padding: '14px 18px', borderBottom: `1px solid ${colors.borderSoft}`, fontSize: 14 },
+  usersHeader: { background: colors.bg, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.1em', color: colors.muted, fontWeight: 600 },
+  roleSelect: { padding: '5px 8px', fontSize: 12.5, border: `1px solid ${colors.border}`, borderRadius: 4, background: colors.surface, fontFamily: fonts.body, color: colors.inkSoft },
+  roleBadge: (role) => ({ display: 'inline-flex', alignItems: 'center', padding: '3px 9px', borderRadius: 999, fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', background: role === 'admin' ? 'var(--c-green-bg)' : role === 'editor' ? 'var(--c-blue-bg)' : 'var(--c-ochre-bg)', color: role === 'admin' ? 'var(--c-green)' : role === 'editor' ? 'var(--c-blue)' : 'var(--c-ochre)' }),
+
+  createUserPanel: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, padding: '22px 26px', marginBottom: 22 },
+  createUserGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 },
+
+  // Reports
+  reportFilters: { display: 'flex', gap: 14, marginBottom: 22, flexWrap: 'wrap' },
+  reportSelect: { padding: '9px 12px', fontSize: 13.5, border: `1px solid ${colors.border}`, borderRadius: 4, background: colors.bg, fontFamily: fonts.body, color: colors.ink, minWidth: 160 },
+  eventTimeline: { display: 'flex', flexDirection: 'column', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, overflow: 'hidden' },
+  eventRow: { display: 'flex', alignItems: 'center', gap: 14, padding: '10px 18px', borderBottom: `1px solid ${colors.borderSoft}`, fontSize: 13 },
+  eventTime: { fontSize: 12, color: colors.muted, width: 90, flexShrink: 0 },
+  eventUser: { fontWeight: 500, width: 110, flexShrink: 0 },
+  eventAction: { color: colors.inkSoft, width: 160, flexShrink: 0 },
+  eventMeta: { fontSize: 12.5, color: colors.muted, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
 };
