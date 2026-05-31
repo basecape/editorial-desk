@@ -356,7 +356,7 @@ export default function EditorialDesk() {
   useEffect(() => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
-    link.href = 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..700&family=Instrument+Sans:wght@400;500;600&display=swap';
+    link.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
     document.head.appendChild(link);
     return () => { try { document.head.removeChild(link); } catch {} };
   }, []);
@@ -484,7 +484,11 @@ export default function EditorialDesk() {
       return next;
     });
   };
-  const publishDraft = (draft) => {
+  const publishDraft = async (draft, options = {}) => {
+    // Optionally learn from edits before publishing
+    if (options.learnFromEdits && options.originalContent && options.originalContent.trim() !== draft.content.trim()) {
+      await learnFromEdits(options.originalContent, draft.content, draft.category, draft.title);
+    }
     const published = { ...draft, status: 'published', publishedAt: Date.now() };
     setLibraryItems(prev => {
       const next = [published, ...prev];
@@ -492,7 +496,8 @@ export default function EditorialDesk() {
       return next;
     });
     deleteDraft(draft.id);
-    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type });
+    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type, learnedFromEdits: !!options.learnFromEdits });
+    setModal(null);
     showToast('Published to library', 'success');
   };
   const deleteLibraryItem = (id) => {
@@ -665,13 +670,33 @@ export default function EditorialDesk() {
   const buildLinkingContext = () => {
     const targets = [];
     sitePages.forEach(p => { if (p.url) targets.push({ title: p.title, url: p.url, keyword: p.keyword || '', cluster: p.cluster || '' }); });
-    libraryItems.forEach(l => { if (l.url) targets.push({ title: l.title, url: l.url, keyword: l.keyword || '', cluster: l.cluster || '' }); });
-    if (targets.length === 0) return '';
-    let out = 'INTERNAL LINK TARGETS — pages on this site you can link to from the article body:\n\n';
-    targets.forEach(t => {
-      out += `- "${t.title}" — ${t.url}${t.keyword ? ` (about: ${t.keyword})` : ''}${t.cluster ? ` [cluster: ${t.cluster}]` : ''}\n`;
+    libraryItems.forEach(l => {
+      const url = l.wpLink || l.url;
+      if (url) targets.push({ title: l.title, url, keyword: l.keyword || '', cluster: l.cluster || '' });
     });
-    out += '\nINTERNAL LINKING INSTRUCTIONS:\n- Where a sentence in your article naturally mentions a topic covered by one of the pages above, link to it using markdown: [anchor text](url)\n- Aim for 2–5 internal links per article. Quality over quantity.\n- Anchor text should be natural — descriptive phrases, NOT "click here" or the bare title.\n- Only link where it genuinely helps the reader continue learning. Do not stuff.\n- Never link to a page whose topic conflicts with what you are saying.';
+    if (targets.length === 0) return '';
+    const minLinks = Math.min(3, targets.length);
+    const maxLinks = Math.min(5, targets.length);
+    let out = '═══════════════════════════════════════════════\n';
+    out += 'INTERNAL LINKS — REQUIRED. You MUST add inline contextual links to these pages within the article body.\n';
+    out += '═══════════════════════════════════════════════\n\n';
+    out += `Available pages on this site (${targets.length} total):\n\n`;
+    targets.forEach(t => {
+      out += `• "${t.title}" → ${t.url}${t.keyword ? `\n  (this page covers: ${t.keyword})` : ''}${t.cluster ? `\n  (cluster: ${t.cluster})` : ''}\n\n`;
+    });
+    out += `\nREQUIREMENTS:\n`;
+    out += `1. Insert ${minLinks}–${maxLinks} inline links naturally within the article body.\n`;
+    out += `2. Use markdown link syntax: [anchor phrase](url)\n`;
+    out += `3. Anchor text must be a meaningful noun phrase that flows in the sentence — NEVER "click here", "read more", or the bare title.\n`;
+    out += `4. Place each link where the surrounding sentence naturally mentions that topic.\n`;
+    out += `5. Don't link to the same page twice.\n`;
+    out += `6. Don't link to a page that contradicts what you're saying.\n\n`;
+    out += `EXAMPLE of GOOD inline linking:\n`;
+    out += `  "If you've been feeling drained lately, [persistent fatigue can be an early sign of low iron](https://example.co.za/iron-deficiency), especially for women under 40."\n\n`;
+    out += `EXAMPLE of BAD inline linking (do NOT do this):\n`;
+    out += `  "To learn more about iron deficiency, click here."\n`;
+    out += `  "We have an article on iron deficiency: Iron Deficiency Symptoms in Women."\n\n`;
+    out += `If a target page's topic is clearly covered in your article (mentioned by name or addressed at length), you MUST link to it. Failing to add the required number of inline links is a formatting violation.\n`;
     return out;
   };
 
@@ -882,35 +907,40 @@ Return ONLY a JSON array (no preamble, no fences):
     }
   };
 
-  // Learn patterns from an approved article
+  // Learn patterns from an approved article — targets the article's category training
   const learnFromApproved = async (item) => {
     setModal({ type: 'loading', message: `Extracting patterns from "${item.title}"…` });
     try {
-      const prompt = `This article was approved by the editor as a successful example of our voice and style:
+      const cat = item.category || 'health_guides';
+      const catTrainText = categoryTraining[cat] || '';
+      const prompt = `This article was approved by the editor as a successful example for the "${cat}" category:
 
 """
 ${item.content}
 """
 
-Current instructions in use:
+Current training for the "${cat}" category:
+"""
+${catTrainText || '(empty — no rules yet)'}
+"""
+
+General instructions in use:
 """
 ${settings.instructions}
 """
 
-Current style guide:
-"""
-${settings.style}
-"""
+Identify 2–4 specific patterns this article uses well that AREN'T already captured in the ${cat} category training above. Focus on patterns specific to writing for the "${cat}" category — voice, structure, sourcing, terminology, examples.
 
-Identify 2–4 patterns this article uses well that AREN'T already captured in the instructions or style guide. Patterns worth codifying so future articles inherit them.
+Default target: "category" (add to the ${cat} training). Use "instructions" only for patterns that genuinely apply to ALL categories, not just ${cat}.
 
 Return ONLY a JSON array (no preamble, no fences):
 [
   {
-    "diagnosis": "the pattern observed",
-    "target": "instructions" | "style",
-    "text": "the rule to add as a new paragraph or bullet",
-    "rationale": "why codifying this matters"
+    "diagnosis": "the specific pattern observed (one sentence)",
+    "target": "category" | "instructions" | "style",
+    "categoryKey": "${cat}",
+    "text": "the rule to add — written as a directive sentence ('Always X', 'Avoid Y', 'When writing about Z, do W')",
+    "rationale": "why codifying this matters (one sentence)"
   }
 ]`;
       const text = await callClaude(prompt, false, 2000);
@@ -918,36 +948,112 @@ Return ONLY a JSON array (no preamble, no fences):
       addTrainingEvent({
         kind: 'learn',
         data: {
-          itemId: item.id, title: item.title,
-          patches: patches.map(p => ({ ...p, id: uid(), status: 'pending' }))
+          itemId: item.id, title: item.title, categoryKey: cat,
+          patches: patches.map(p => ({ ...p, id: uid(), status: 'pending', categoryKey: p.categoryKey || cat }))
         }
       });
       setModal(null);
-      showToast(`${patches.length} pattern${patches.length === 1 ? '' : 's'} extracted`, 'success');
+      showToast(`${patches.length} pattern${patches.length === 1 ? '' : 's'} extracted for ${cat}`, 'success');
     } catch (e) {
       setModal({ type: 'error', message: e.message });
     }
   };
 
-  // Apply a patch to instructions or style
+  // Learn from editor's revisions — extract patterns from the diff
+  const learnFromEdits = async (originalContent, editedContent, category, title) => {
+    setModal({ type: 'loading', message: 'Learning from your edits…' });
+    try {
+      const cat = category || 'health_guides';
+      const prompt = `An editor reviewed an AI-generated article and made edits before approving. Compare the two versions and extract the patterns the editor preferred, so future articles in the "${cat}" category automatically apply them.
+
+ORIGINAL AI-GENERATED VERSION:
+"""
+${originalContent}
+"""
+
+EDITOR'S REVISED VERSION:
+"""
+${editedContent}
+"""
+
+Category: ${cat}
+Article title: ${title}
+
+Look for what the editor changed and why it matters. Examples:
+- Replaced jargon with plainer wording → "Avoid clinical jargon; use everyday phrases the reader uses."
+- Added a specific SA reference → "Include at least one SA-specific reference (SAMRC, NICD, local prices, local foods)."
+- Reorganised structure → "Lead with the practical takeaway, then explain the science."
+- Shortened sections → "Keep H2 sections under 200 words."
+
+Extract 1–3 concise training rules. These will be added to the "${cat}" category training so the AI doesn't repeat the same mistakes.
+
+Return ONLY a JSON array (no preamble, no fences):
+[
+  {
+    "diagnosis": "what the editor changed (one sentence)",
+    "target": "category",
+    "categoryKey": "${cat}",
+    "text": "the rule, written as a directive ('Always X', 'Avoid Y')",
+    "rationale": "why this matters for ${cat} (one sentence)"
+  }
+]`;
+      const text = await callClaude(prompt, false, 2000);
+      const patches = extractJsonArray(text);
+      const event = addTrainingEvent({
+        kind: 'learn',
+        data: {
+          source: 'edits',
+          title,
+          categoryKey: cat,
+          originalContent: originalContent.slice(0, 4000),
+          editedContent: editedContent.slice(0, 4000),
+          patches: patches.map(p => ({ ...p, id: uid(), status: 'pending', categoryKey: p.categoryKey || cat }))
+        }
+      });
+      setModal(null);
+      showToast(`Learned ${patches.length} pattern${patches.length === 1 ? '' : 's'} from your edits`, 'success');
+      return event;
+    } catch (e) {
+      setModal({ type: 'error', message: e.message });
+      return null;
+    }
+  };
+
+  // Apply a patch to instructions, style, or category training
   const applyPatch = (parentEventId, patchId, editedText) => {
     const parent = trainingEvents.find(e => e.id === parentEventId);
     if (!parent) return;
     const patch = (parent.data.patches || []).find(p => p.id === patchId);
     if (!patch) return;
     const finalText = editedText || patch.text;
-    const target = patch.target === 'style' ? 'style' : 'instructions';
     const stamp = new Date().toISOString().slice(0, 10);
-    const newSetting = `${settings[target].trimEnd()}\n\n[Trained ${stamp}] ${finalText}`;
-    const updated = { ...settings, [target]: newSetting };
-    setSettings(updated);
-    storage.set('settings', updated);
+
+    if (patch.target === 'category') {
+      const cat = patch.categoryKey || parent.data.categoryKey || 'health_guides';
+      const current = categoryTraining[cat] || '';
+      const newText = current.trim()
+        ? `${current.trimEnd()}\n\n[Trained ${stamp}] ${finalText}`
+        : `[Trained ${stamp}] ${finalText}`;
+      const updated = { ...categoryTraining, [cat]: newText };
+      setCategoryTraining(updated);
+      storage.set('categoryTraining', updated);
+      logAction('category_training.update', { category: cat, addedText: finalText.slice(0, 120) });
+      showToast(`Added to ${cat} training`, 'success');
+    } else {
+      const target = patch.target === 'style' ? 'style' : 'instructions';
+      const newSetting = `${settings[target].trimEnd()}\n\n[Trained ${stamp}] ${finalText}`;
+      const updated = { ...settings, [target]: newSetting };
+      setSettings(updated);
+      storage.set('settings', updated);
+      logAction('settings.update', { target, addedText: finalText.slice(0, 120) });
+      showToast(`Added to ${target}`, 'success');
+    }
     // Mark patch applied
     const updatedPatches = parent.data.patches.map(p =>
       p.id === patchId ? { ...p, status: 'applied', appliedText: finalText, appliedAt: Date.now() } : p
     );
     updateTrainingEvent(parentEventId, { data: { ...parent.data, patches: updatedPatches } });
-    showToast(`Added to ${target}`, 'success');
+    logAction('training.patch_applied', { target: patch.target, categoryKey: patch.categoryKey });
   };
 
   const dismissPatch = (parentEventId, patchId) => {
@@ -1129,7 +1235,7 @@ Return ONLY a JSON array (no preamble, no fences):
               draft={modal.draft}
               fromLibrary={modal.fromLibrary}
               onSave={(patch) => updateDraft(modal.draft.id, patch)}
-              onPublish={() => { publishDraft(modal.draft); setModal(null); }}
+              onPublish={(options) => { publishDraft(modal.draft, options); }}
               onExport={() => setModal({ type: 'export', item: modal.draft })}
               onClose={() => setModal(null)}
               showToast={showToast}
@@ -1592,15 +1698,17 @@ function PipelineView({
           </div>
           <div style={styles.countWrap}>
             <label style={styles.topicInputLabel}>Topics <span style={styles.countBadgeInline}>{count}</span></label>
-            <input
-              type="range"
-              min={5}
-              max={50}
-              step={5}
-              value={count}
-              onChange={e => setCount(+e.target.value)}
-              style={styles.slider}
-            />
+            <div style={styles.countPillRow}>
+              {[1, 2, 3, 4, 5, 10, 20, 30, 40, 50].map(n => (
+                <button
+                  key={n}
+                  onClick={() => setCount(n)}
+                  style={{ ...styles.countPill, ...(count === n ? styles.countPillActive : {}) }}
+                >
+                  {n}
+                </button>
+              ))}
+            </div>
           </div>
           <button style={{ ...styles.primaryBtn, alignSelf: 'flex-end' }} onClick={() => onGenerate(count)}>
             <Sparkles size={15} /> Generate
@@ -2221,39 +2329,80 @@ function ErrorPanel({ message, onClose }) {
 function DraftView({ draft, fromLibrary, onSave, onPublish, onExport, onClose, showToast }) {
   const [content, setContent] = useState(draft.content);
   const [editing, setEditing] = useState(false);
+  const [confirmStep, setConfirmStep] = useState(null); // null | 'learn-prompt'
+  const originalContent = draft.content; // snapshot at open time
+  const hasEdits = content.trim() !== originalContent.trim();
+
   const save = () => { onSave({ content }); setEditing(false); showToast('Draft saved', 'success'); };
   const copy = async () => {
     try { await navigator.clipboard.writeText(content); showToast('Copied'); }
     catch { showToast('Copy failed', 'error'); }
   };
+
+  const handleApproveClick = () => {
+    // Always save first if there are edits
+    if (hasEdits) {
+      onSave({ content });
+      setConfirmStep('learn-prompt');
+    } else {
+      onPublish({ learnFromEdits: false });
+    }
+  };
+
   return (
     <div style={styles.draftViewPanel}>
       <div style={styles.draftViewHeader}>
         <div>
           <div style={styles.draftViewEyebrow}>
-            {fromLibrary ? 'Published' : 'Draft for review'} · {draft.type}
+            {fromLibrary ? 'Published' : 'Draft for review'} · {draft.type} · {draft.category}
           </div>
           <h2 style={styles.formTitle}>{draft.title}</h2>
           {draft.meta && <p style={styles.metaPreview}>{draft.meta}</p>}
         </div>
         <button style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
       </div>
-      {editing ? (
-        <textarea value={content} onChange={e => setContent(e.target.value)} style={styles.draftEditor} rows={24} />
+
+      {confirmStep === 'learn-prompt' ? (
+        <div style={styles.learnPrompt}>
+          <div style={styles.learnPromptIcon}><GraduationCap size={28} /></div>
+          <h3 style={styles.learnPromptTitle}>You made edits — want to learn from them?</h3>
+          <p style={styles.learnPromptBody}>
+            I can compare your edited version to the original AI draft and extract 1–3 patterns to add to the <strong>{draft.category}</strong> category training. Future articles in this category will follow your patterns automatically.
+          </p>
+          <div style={styles.learnPromptActions}>
+            <button style={styles.secondaryBtn} onClick={() => onPublish({ learnFromEdits: false })}>
+              Skip — just publish
+            </button>
+            <button style={styles.primaryBtn} onClick={() => onPublish({ learnFromEdits: true, originalContent })}>
+              <GraduationCap size={15} /> Learn & publish
+            </button>
+          </div>
+        </div>
       ) : (
-        <div style={styles.draftContent}><FormattedMarkdown text={content} /></div>
+        <>
+          {editing ? (
+            <textarea value={content} onChange={e => setContent(e.target.value)} style={styles.draftEditor} rows={24} />
+          ) : (
+            <div style={styles.draftContent}><FormattedMarkdown text={content} /></div>
+          )}
+          <div style={styles.draftViewActions}>
+            {hasEdits && !editing && (
+              <span style={styles.editedIndicator}>
+                <Edit3 size={11} /> edited
+              </span>
+            )}
+            <button style={styles.secondaryBtn} onClick={copy}><Copy size={14} /> Copy markdown</button>
+            {!fromLibrary && (
+              editing
+                ? <button style={styles.secondaryBtn} onClick={save}><Save size={14} /> Save edits</button>
+                : <button style={styles.secondaryBtn} onClick={() => setEditing(true)}><Edit3 size={14} /> Edit</button>
+            )}
+            {fromLibrary
+              ? <button style={styles.primaryBtn} onClick={onExport}><FileCode size={15} /> Export to WordPress</button>
+              : <button style={styles.primaryBtn} onClick={handleApproveClick}><Check size={15} /> Approve & publish</button>}
+          </div>
+        </>
       )}
-      <div style={styles.draftViewActions}>
-        <button style={styles.secondaryBtn} onClick={copy}><Copy size={14} /> Copy markdown</button>
-        {!fromLibrary && (
-          editing
-            ? <button style={styles.secondaryBtn} onClick={save}><Save size={14} /> Save edits</button>
-            : <button style={styles.secondaryBtn} onClick={() => setEditing(true)}><Edit3 size={14} /> Edit</button>
-        )}
-        {fromLibrary
-          ? <button style={styles.primaryBtn} onClick={onExport}><FileCode size={15} /> Export to WordPress</button>
-          : <button style={styles.primaryBtn} onClick={onPublish}><Check size={15} /> Approve & publish</button>}
-      </div>
     </div>
   );
 }
@@ -2835,10 +2984,12 @@ function PatchCard({ patch, onApply, onDismiss }) {
     <div style={{ ...styles.patchCard, ...(applied ? styles.patchCardApplied : {}) }}>
       <div style={styles.patchHeader}>
         {applied ? (
-          <span style={styles.patchBadgeApplied}><Check size={11} /> Added to {patch.target}</span>
+          <span style={styles.patchBadgeApplied}>
+            <Check size={11} /> Added to {patch.target === 'category' ? `${patch.categoryKey} training` : patch.target}
+          </span>
         ) : (
           <span style={styles.patchBadge}>
-            <Wand2 size={11} /> Suggested patch → {patch.target}
+            <Wand2 size={11} /> Suggested patch → {patch.target === 'category' ? `${patch.categoryKey} training` : patch.target}
           </span>
         )}
       </div>
@@ -3070,7 +3221,7 @@ function SetupScreen({ onComplete, theme = 'light' }) {
   useEffect(() => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
-    link.href = 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..700&family=Instrument+Sans:wght@400;500;600&display=swap';
+    link.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
     document.head.appendChild(link);
     return () => { try { document.head.removeChild(link); } catch {} };
   }, []);
@@ -3142,7 +3293,7 @@ function LoginScreen({ onLogin, theme = 'light' }) {
   useEffect(() => {
     const link = document.createElement('link');
     link.rel = 'stylesheet';
-    link.href = 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300..700&family=Instrument+Sans:wght@400;500;600&display=swap';
+    link.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
     document.head.appendChild(link);
     return () => { try { document.head.removeChild(link); } catch {} };
   }, []);
@@ -3593,7 +3744,7 @@ function ReportsView({ showToast }) {
 // ============================================================================
 
 function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster }) {
-  const [viewMode, setViewMode] = useState('visual'); // 'visual' | 'detailed'
+  const [viewMode, setViewMode] = useState('list'); // 'list' | 'visual'
   const [collapsed, setCollapsed] = useState({});
 
   // Aggregate everything into clusters
@@ -3673,16 +3824,16 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
       <div style={styles.sitemapControls}>
         <div style={styles.viewToggle}>
           <button
+            onClick={() => setViewMode('list')}
+            style={{ ...styles.viewToggleBtn, ...(viewMode === 'list' ? styles.viewToggleBtnActive : {}) }}
+          >
+            <FileText size={14} /> List
+          </button>
+          <button
             onClick={() => setViewMode('visual')}
             style={{ ...styles.viewToggleBtn, ...(viewMode === 'visual' ? styles.viewToggleBtnActive : {}) }}
           >
-            <Eye size={14} /> Visual map
-          </button>
-          <button
-            onClick={() => setViewMode('detailed')}
-            style={{ ...styles.viewToggleBtn, ...(viewMode === 'detailed' ? styles.viewToggleBtnActive : {}) }}
-          >
-            <FileText size={14} /> Detailed list
+            <Eye size={14} /> Coverage map
           </button>
         </div>
         <div style={styles.legend}>
@@ -3780,59 +3931,141 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
           })}
         </div>
       ) : (
-        // Detailed list (original)
-        <div style={styles.clusterList}>
-          {clusterEntries.map(([clusterName, buckets]) => {
-            const total = Object.values(buckets).reduce((s, arr) => s + arr.length, 0);
-            const isCollapsed = collapsed[clusterName];
-            return (
-              <section key={clusterName} style={styles.clusterCard}>
-                <header style={styles.clusterHead} onClick={() => setCollapsed(s => ({ ...s, [clusterName]: !isCollapsed }))}>
-                  <button style={styles.expandBtn}>
-                    {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-                  </button>
-                  <h3 style={styles.clusterTitle}>{clusterName}</h3>
-                  <div style={styles.clusterMeta}>
-                    {buckets.live.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-blue-bg)', color: 'var(--c-blue)' }}>{buckets.live.length} live</span>}
-                    {buckets.planned.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-ochre-bg)', color: 'var(--c-ochre)' }}>{buckets.planned.length} planned</span>}
-                    {buckets.writing.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-warning-bg)', color: 'var(--c-warning-text)' }}>{buckets.writing.length} writing</span>}
-                    {buckets.drafting.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-green-bg)', color: 'var(--c-green)' }}>{buckets.drafting.length} draft</span>}
-                    {buckets.ready.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-green-bg)', color: 'var(--c-green-deep)' }}>{buckets.ready.length} ready</span>}
-                    {buckets.deployed.length > 0 && <span style={{ ...styles.clusterChip, background: 'var(--c-green-bg)', color: 'var(--c-green-deep)' }}>{buckets.deployed.length} deployed</span>}
-                    <span style={styles.clusterTotal}>{total} {total === 1 ? 'page' : 'pages'}</span>
-                  </div>
-                </header>
-
-                {!isCollapsed && (
-                  <div style={styles.clusterBody}>
-                    {[
-                      { key: 'live', label: 'Live', items: buckets.live },
-                      { key: 'planned', label: 'Planned (topics)', items: buckets.planned },
-                      { key: 'writing', label: 'Writing', items: buckets.writing },
-                      { key: 'drafting', label: 'In draft', items: buckets.drafting },
-                      { key: 'ready', label: 'Ready to publish', items: buckets.ready },
-                      { key: 'deployed', label: 'Deployed', items: buckets.deployed },
-                    ].filter(b => b.items.length > 0).map(b => (
-                      <div key={b.key}>
-                        <div style={styles.bucketLabel}>{b.label}</div>
-                        {b.items.map(item => (
-                          <SitemapItem
-                            key={item.id}
-                            item={item}
-                            onEdit={item.kind === 'page' ? () => onEdit(item) : null}
-                            onDelete={item.kind === 'page' ? () => onDelete(item.id) : null}
-                          />
-                        ))}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
-            );
-          })}
-        </div>
+        // Indented list — category > cluster > pages
+        <SitemapTreeList
+          clusterEntries={clusterEntries}
+          collapsed={collapsed}
+          setCollapsed={setCollapsed}
+          onEdit={onEdit}
+          onDelete={onDelete}
+        />
       )}
     </>
+  );
+}
+
+function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDelete }) {
+  // Build hierarchy: category → cluster → pages
+  const tree = {};
+  clusterEntries.forEach(([clusterName, buckets]) => {
+    const allItems = [
+      ...buckets.live, ...buckets.deployed, ...buckets.ready,
+      ...buckets.drafting, ...buckets.writing, ...buckets.planned,
+    ];
+    if (allItems.length === 0) return;
+    // Group within cluster by category
+    allItems.forEach(item => {
+      const cat = item.category || 'uncategorised';
+      if (!tree[cat]) tree[cat] = {};
+      if (!tree[cat][clusterName]) tree[cat][clusterName] = [];
+      tree[cat][clusterName].push(item);
+    });
+  });
+
+  const CATEGORY_LABELS = {
+    fitness: 'Fitness',
+    nutrition: 'Nutrition',
+    mental_health: 'Mental health',
+    health_guides: 'Health guides',
+    beauty: 'Beauty',
+    uncategorised: 'Uncategorised',
+  };
+
+  const sortedCategories = Object.keys(tree).sort((a, b) => {
+    if (a === 'uncategorised') return 1;
+    if (b === 'uncategorised') return -1;
+    return (CATEGORY_LABELS[a] || a).localeCompare(CATEGORY_LABELS[b] || b);
+  });
+
+  return (
+    <div style={styles.treeList}>
+      {sortedCategories.map(cat => {
+        const catKey = `cat:${cat}`;
+        const catCollapsed = collapsed[catKey];
+        const clustersInCat = Object.entries(tree[cat]).sort((a, b) => b[1].length - a[1].length);
+        const totalPages = clustersInCat.reduce((s, [, items]) => s + items.length, 0);
+
+        return (
+          <div key={cat} style={styles.treeCategory}>
+            <button
+              onClick={() => setCollapsed(s => ({ ...s, [catKey]: !catCollapsed }))}
+              style={styles.treeCategoryHead}
+            >
+              {catCollapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+              <span style={styles.treeCategoryTitle}>{CATEGORY_LABELS[cat] || cat}</span>
+              <span style={styles.treeCategoryCount}>{totalPages}</span>
+            </button>
+
+            {!catCollapsed && clustersInCat.map(([clusterName, items]) => {
+              const clusterKey = `${cat}:${clusterName}`;
+              const clCollapsed = collapsed[clusterKey];
+              const sortedItems = [...items].sort((a, b) => {
+                // sort by status: live first, then ready, draft, writing, planned
+                const order = { LIVE: 0, DEPLOYED: 1, READY: 2, DRAFT: 3, WRITING: 4, PLANNED: 5 };
+                return (order[a._status] || 9) - (order[b._status] || 9);
+              });
+
+              return (
+                <div key={clusterName} style={styles.treeCluster}>
+                  <button
+                    onClick={() => setCollapsed(s => ({ ...s, [clusterKey]: !clCollapsed }))}
+                    style={styles.treeClusterHead}
+                  >
+                    {clCollapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+                    <span style={styles.treeClusterTitle}>{clusterName}</span>
+                    <span style={styles.treeClusterCount}>{items.length}</span>
+                  </button>
+
+                  {!clCollapsed && (
+                    <div style={styles.treePageList}>
+                      {sortedItems.map(item => (
+                        <TreePage
+                          key={item.id}
+                          item={item}
+                          onEdit={item.kind === 'page' ? () => onEdit(item) : null}
+                          onDelete={item.kind === 'page' ? () => onDelete(item.id) : null}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TreePage({ item, onEdit, onDelete }) {
+  const STATUS_LABELS = {
+    LIVE: 'live',
+    DEPLOYED: 'deployed',
+    READY: 'ready',
+    DRAFT: 'draft',
+    WRITING: 'writing',
+    PLANNED: 'planned',
+  };
+  const statusClass = (item._status || '').toLowerCase();
+
+  return (
+    <div style={styles.treePage}>
+      <span style={styles.treeBullet}>·</span>
+      <span style={styles.treePageTitle}>{item.title}</span>
+      <span style={{ ...styles.treeStatus, ...(styles[`treeStatus_${statusClass}`] || {}) }}>{STATUS_LABELS[item._status] || item._status}</span>
+      {item.url && (
+        <a href={item.url} target="_blank" rel="noopener" style={styles.treePageLink}>
+          <ExternalLink size={11} />
+        </a>
+      )}
+      {(onEdit || onDelete) && (
+        <div style={styles.treePageActions}>
+          {onEdit && <button style={styles.iconBtnSm} onClick={onEdit} title="Edit"><Edit3 size={11} /></button>}
+          {onDelete && <button style={styles.iconBtnSm} onClick={onDelete} title="Delete"><Trash2 size={11} /></button>}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -4089,7 +4322,15 @@ const globalCss = `
   }
 
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--c-bg); color: var(--c-ink); }
+  body {
+    margin: 0;
+    background: var(--c-bg);
+    color: var(--c-ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "cv11", "ss01", "ss03";
+  }
   textarea, input, select { font-family: inherit; color: var(--c-ink); background: var(--c-input-bg); }
   textarea:focus, input:focus, select:focus { outline: none; border-color: var(--c-green) !important; }
   button { cursor: pointer; font-family: inherit; }
@@ -4147,12 +4388,12 @@ const colors = {
 };
 
 const fonts = {
-  display: "'Fraunces', 'Iowan Old Style', Georgia, serif",
-  body: "'Instrument Sans', -apple-system, system-ui, sans-serif",
+  display: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
+  body: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
 };
 
 const styles = {
-  app: { minHeight: '100vh', background: colors.bg, color: colors.ink, fontFamily: fonts.body, fontSize: 15, lineHeight: 1.55 },
+  app: { minHeight: '100vh', background: colors.bg, color: colors.ink, fontFamily: fonts.body, fontSize: 14.5, lineHeight: 1.55 },
   loading: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.bg },
 
   // === SIDEBAR LAYOUT ===
@@ -4174,7 +4415,7 @@ const styles = {
     padding: '20px 18px 16px',
     borderBottom: `1px solid ${colors.borderSoft}`,
   },
-  sidebarBrandTitle: { fontFamily: fonts.display, fontSize: 16, fontWeight: 500, letterSpacing: '-0.012em', lineHeight: 1.1, color: colors.ink },
+  sidebarBrandTitle: { fontFamily: fonts.display, fontSize: 14.5, fontWeight: 600, letterSpacing: '-0.012em', lineHeight: 1.1, color: colors.ink },
   sidebarBrandSub: { fontSize: 10, color: colors.muted, letterSpacing: '0.1em', textTransform: 'uppercase', marginTop: 3, fontWeight: 500 },
 
   sidebarNav: { flex: 1, overflowY: 'auto', padding: '12px 10px' },
@@ -4254,7 +4495,7 @@ const styles = {
 
   brand: { display: 'flex', alignItems: 'center', gap: 14 }, // kept for auth screens
   brandMark: { fontSize: 24, fontFamily: fonts.display, color: colors.green, lineHeight: 1 },
-  brandTitle: { fontFamily: fonts.display, fontSize: 20, fontWeight: 500, letterSpacing: '-0.01em', lineHeight: 1.1, color: colors.ink },
+  brandTitle: { fontFamily: fonts.display, fontSize: 16, fontWeight: 600, letterSpacing: '-0.01em', lineHeight: 1.1, color: colors.ink },
   brandSub: { fontSize: 11, color: colors.muted, letterSpacing: '0.08em', textTransform: 'uppercase', marginTop: 3, fontWeight: 500 },
 
   mainArea: {
@@ -4280,7 +4521,7 @@ const styles = {
     borderRadius: 6, padding: '7px 8px', color: colors.ink,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
-  topBarTitle: { fontFamily: fonts.display, fontSize: 18, fontWeight: 500, letterSpacing: '-0.015em', color: colors.ink },
+  topBarTitle: { fontFamily: fonts.display, fontSize: 16, fontWeight: 600, letterSpacing: '-0.015em', color: colors.ink },
 
   main: { maxWidth: 1180, margin: '0 auto', padding: '40px 38px 80px', width: '100%' },
 
@@ -4289,7 +4530,7 @@ const styles = {
 
   pageHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 28, gap: 24, flexWrap: 'wrap' },
   eyebrow: { fontSize: 11, letterSpacing: '0.16em', textTransform: 'uppercase', color: colors.muted, fontWeight: 500, marginBottom: 8 },
-  pageTitle: { fontFamily: fonts.display, fontSize: 44, fontWeight: 400, letterSpacing: '-0.025em', lineHeight: 1, margin: 0, fontVariationSettings: '"opsz" 144' },
+  pageTitle: { fontFamily: fonts.display, fontSize: 38, fontWeight: 600, letterSpacing: '-0.025em', lineHeight: 1, margin: 0 },
   pageSub: { fontSize: 15, color: colors.muted, marginTop: 10, maxWidth: 520, lineHeight: 1.5 },
 
   primaryBtn: { display: 'inline-flex', alignItems: 'center', gap: 7, padding: '10px 18px', background: colors.buttonActiveBg, color: colors.buttonActiveText, border: 'none', borderRadius: 999, fontSize: 13.5, fontWeight: 500, letterSpacing: '-0.005em', transition: 'all 0.15s' },
@@ -4300,7 +4541,43 @@ const styles = {
   topicInputWrap: { flex: '1 1 320px', display: 'flex', flexDirection: 'column', gap: 6 },
   topicInputLabel: { fontSize: 10.5, textTransform: 'uppercase', letterSpacing: '0.1em', color: colors.muted, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 6 },
   topicInput: { padding: '11px 14px', fontSize: 15, border: `1px solid ${colors.border}`, borderRadius: 4, fontFamily: fonts.body, background: colors.bg, color: colors.ink },
-  countWrap: { flex: '0 1 200px', display: 'flex', flexDirection: 'column', gap: 6 },
+  // Sitemap tree (indented list)
+  treeList: { display: 'flex', flexDirection: 'column', gap: 2 },
+  treeCategory: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, marginBottom: 8, overflow: 'hidden' },
+  treeCategoryHead: { display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '13px 16px', background: colors.surface, border: 'none', textAlign: 'left', fontFamily: fonts.body, color: colors.ink },
+  treeCategoryTitle: { fontSize: 14.5, fontWeight: 600, flex: 1, letterSpacing: '-0.005em' },
+  treeCategoryCount: { fontSize: 11, color: colors.muted, fontWeight: 600, padding: '2px 8px', background: colors.bg, borderRadius: 999 },
+  treeCluster: { borderTop: `1px solid ${colors.borderSoft}` },
+  treeClusterHead: { display: 'flex', alignItems: 'center', gap: 8, width: '100%', padding: '9px 16px 9px 36px', background: 'transparent', border: 'none', textAlign: 'left', fontFamily: fonts.body, color: colors.inkSoft },
+  treeClusterTitle: { fontSize: 13, fontWeight: 500, flex: 1 },
+  treeClusterCount: { fontSize: 11, color: colors.muted, fontVariantNumeric: 'tabular-nums' },
+  treePageList: { paddingBottom: 6 },
+  treePage: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 16px 5px 62px', fontSize: 13, color: colors.inkSoft, transition: 'background 0.1s', position: 'relative' },
+  treeBullet: { color: colors.faint, fontWeight: 700, fontSize: 14, lineHeight: 1, width: 4, textAlign: 'center' },
+  treePageTitle: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  treeStatus: { fontSize: 10, fontWeight: 600, padding: '1px 7px', borderRadius: 3, letterSpacing: '0.04em', textTransform: 'uppercase', flexShrink: 0 },
+  treeStatus_live: { background: 'var(--c-blue-bg)', color: 'var(--c-blue)' },
+  treeStatus_deployed: { background: 'var(--c-green-bg)', color: 'var(--c-green-deep)' },
+  treeStatus_ready: { background: 'var(--c-green-bg)', color: 'var(--c-green)' },
+  treeStatus_draft: { background: 'var(--c-ochre-bg)', color: 'var(--c-ochre)' },
+  treeStatus_writing: { background: 'var(--c-warning-bg)', color: 'var(--c-warning-text)' },
+  treeStatus_planned: { background: colors.bg, color: colors.muted, border: `1px solid ${colors.borderSoft}` },
+  treePageLink: { color: colors.muted, display: 'flex', alignItems: 'center', textDecoration: 'none', padding: 2 },
+  treePageActions: { display: 'flex', gap: 2 },
+  iconBtnSm: { background: 'transparent', border: 'none', color: colors.muted, padding: 3, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 3 },
+
+  // Learn-from-edits prompt
+  learnPrompt: { padding: '32px 28px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 },
+  learnPromptIcon: { width: 56, height: 56, borderRadius: '50%', background: 'var(--c-green-bg)', color: 'var(--c-green)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 4 },
+  learnPromptTitle: { fontFamily: fonts.display, fontSize: 20, fontWeight: 600, margin: 0, letterSpacing: '-0.015em', color: colors.ink },
+  learnPromptBody: { fontSize: 14, color: colors.inkSoft, maxWidth: 440, lineHeight: 1.55, margin: '4px 0 16px' },
+  learnPromptActions: { display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'center' },
+  editedIndicator: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', background: 'var(--c-ochre-bg)', color: 'var(--c-ochre)', fontSize: 11, fontWeight: 600, borderRadius: 999, letterSpacing: '0.04em', textTransform: 'uppercase', marginRight: 'auto' },
+
+  countWrap: { flex: '0 1 360px', display: 'flex', flexDirection: 'column', gap: 6 },
+  countPillRow: { display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 2 },
+  countPill: { padding: '6px 10px', minWidth: 34, fontSize: 12.5, fontWeight: 600, border: `1px solid ${colors.border}`, borderRadius: 4, background: colors.surface, color: colors.inkSoft, fontFamily: fonts.body },
+  countPillActive: { background: colors.buttonActiveBg, color: colors.buttonActiveText, borderColor: colors.buttonActiveBg },
   countBadgeInline: { background: colors.buttonActiveBg, color: colors.buttonActiveText, padding: '1px 7px', borderRadius: 999, fontSize: 10, fontWeight: 500, letterSpacing: 0, textTransform: 'none', marginLeft: 'auto' },
 
   subTabRow: { display: 'flex', gap: 4, marginBottom: 20, borderBottom: `1px solid ${colors.borderSoft}` },
@@ -4350,7 +4627,7 @@ const styles = {
   draftRow: { background: colors.surface, padding: '22px 24px', border: `1px solid ${colors.border}`, borderRadius: 4, display: 'flex', gap: 16, alignItems: 'center', cursor: 'pointer', transition: 'border-color 0.15s' },
   draftLeft: { flex: 1, minWidth: 0 },
   draftMeta: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11.5, color: colors.muted, marginBottom: 8, letterSpacing: '0.02em' },
-  draftTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', lineHeight: 1.2, margin: '0 0 6px', fontVariationSettings: '"opsz" 60' },
+  draftTitle: { fontFamily: fonts.display, fontSize: 18, fontWeight: 600, letterSpacing: '-0.018em', lineHeight: 1.2, margin: '0 0 6px' },
   draftPreview: { fontSize: 14, color: colors.muted, margin: 0, lineHeight: 1.5, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' },
   draftActions: { display: 'flex', gap: 8, flexShrink: 0 },
 
@@ -4377,7 +4654,7 @@ const styles = {
   modalOverlay: { position: 'fixed', inset: 0, background: 'var(--c-overlay)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20, animation: 'fadeIn 0.18s ease', backdropFilter: 'blur(4px)' },
   modalBox: { background: colors.bg, borderRadius: 6, maxWidth: 760, width: '100%', maxHeight: '92vh', overflow: 'auto', border: `1px solid ${colors.border}`, boxShadow: '0 20px 60px var(--c-shadow-strong)' },
   formPanel: { padding: '32px 36px' },
-  formTitle: { fontFamily: fonts.display, fontSize: 28, fontWeight: 500, letterSpacing: '-0.022em', margin: '0 0 8px', fontVariationSettings: '"opsz" 96' },
+  formTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 600, letterSpacing: '-0.022em', margin: '0 0 8px' },
   formSub: { fontSize: 14, color: colors.muted, margin: '0 0 24px' },
   formLabel: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11.5, textTransform: 'uppercase', letterSpacing: '0.1em', color: colors.muted, fontWeight: 600, marginTop: 18, marginBottom: 8 },
   slider: { width: '100%', accentColor: colors.green, marginBottom: 0 },
@@ -4417,7 +4694,7 @@ const styles = {
   trainSummary: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, padding: '18px 24px', marginBottom: 24 },
   trainSummaryRow: { display: 'flex', gap: 32, flexWrap: 'wrap', alignItems: 'center' },
   trainStat: { display: 'flex', flexDirection: 'column', gap: 2 },
-  trainStatNum: { fontFamily: fonts.display, fontSize: 28, fontWeight: 500, letterSpacing: '-0.02em', lineHeight: 1, color: colors.ink, fontVariationSettings: '"opsz" 96' },
+  trainStatNum: { fontFamily: fonts.display, fontSize: 26, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1, color: colors.ink },
   trainStatLabel: { fontSize: 11, color: colors.muted, textTransform: 'uppercase', letterSpacing: '0.08em', fontWeight: 500 },
   trainActions: { display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', marginBottom: 32 },
   trainActionCard: {
@@ -4465,8 +4742,8 @@ const styles = {
   topicPreviewAngle: { fontSize: 13.5, color: colors.inkSoft, lineHeight: 1.5, fontStyle: 'italic', fontFamily: fonts.display },
 
   // Markdown rendering
-  mdH1: { fontFamily: fonts.display, fontSize: 30, fontWeight: 500, letterSpacing: '-0.022em', margin: '0 0 18px', lineHeight: 1.15, fontVariationSettings: '"opsz" 96' },
-  mdH2: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', margin: '28px 0 12px', lineHeight: 1.2, fontVariationSettings: '"opsz" 60' },
+  mdH1: { fontFamily: fonts.display, fontSize: 30, fontWeight: 500, letterSpacing: '-0.022em', margin: '0 0 18px', lineHeight: 1.15 },
+  mdH2: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', margin: '28px 0 12px', lineHeight: 1.2 },
   mdH3: { fontFamily: fonts.display, fontSize: 17, fontWeight: 500, letterSpacing: '-0.012em', margin: '22px 0 8px', lineHeight: 1.25 },
   mdP: { margin: '0 0 14px', lineHeight: 1.65, color: colors.inkSoft, fontSize: 15 },
   mdList: { margin: '0 0 16px', paddingLeft: 22 },
@@ -4478,12 +4755,12 @@ const styles = {
   // Sitemap / topical authority
   statsStrip: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 1, background: colors.border, border: `1px solid ${colors.border}`, borderRadius: 6, overflow: 'hidden', marginBottom: 28 },
   statBox: { background: colors.surface, padding: '18px 20px', display: 'flex', flexDirection: 'column', gap: 4 },
-  statValue: { fontFamily: fonts.display, fontSize: 30, fontWeight: 500, letterSpacing: '-0.02em', lineHeight: 1, fontVariationSettings: '"opsz" 96' },
+  statValue: { fontFamily: fonts.display, fontSize: 30, fontWeight: 500, letterSpacing: '-0.02em', lineHeight: 1 },
   statLabel: { fontSize: 11.5, color: colors.muted, fontWeight: 500, letterSpacing: '0.03em', textTransform: 'uppercase' },
   clusterList: { display: 'flex', flexDirection: 'column', gap: 12 },
   clusterCard: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, overflow: 'hidden' },
   clusterHead: { display: 'flex', alignItems: 'center', gap: 10, padding: '16px 20px', cursor: 'pointer', userSelect: 'none', flexWrap: 'wrap' },
-  clusterTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', margin: 0, lineHeight: 1.2, fontVariationSettings: '"opsz" 60' },
+  clusterTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', margin: 0, lineHeight: 1.2 },
   clusterMeta: { display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' },
   clusterChip: { fontSize: 10.5, fontWeight: 600, padding: '3px 9px', borderRadius: 999, letterSpacing: '0.02em', textTransform: 'uppercase' },
   clusterTotal: { fontSize: 11.5, color: colors.muted, marginLeft: 6 },
@@ -4521,7 +4798,7 @@ const styles = {
   // Category training panel
   catTrainPanel: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, marginBottom: 28, overflow: 'hidden' },
   catTrainHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '18px 22px', cursor: 'pointer', userSelect: 'none', gap: 16, flexWrap: 'wrap' },
-  catTrainTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', lineHeight: 1.2, fontVariationSettings: '"opsz" 60' },
+  catTrainTitle: { fontFamily: fonts.display, fontSize: 22, fontWeight: 500, letterSpacing: '-0.018em', lineHeight: 1.2 },
   catTrainSub: { fontSize: 13, color: colors.muted, marginTop: 4, lineHeight: 1.45 },
   catTrainBody: { borderTop: `1px solid ${colors.borderSoft}`, padding: '18px 22px 22px' },
   catTabs: { display: 'flex', gap: 4, marginBottom: 16, flexWrap: 'wrap' },
@@ -4545,7 +4822,7 @@ const styles = {
   authScreen: { minHeight: '100vh', background: colors.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, color: colors.ink, fontFamily: fonts.body, fontSize: 15 },
   authCard: { background: colors.surface, padding: '40px 44px', border: `1px solid ${colors.border}`, borderRadius: 8, maxWidth: 440, width: '100%', boxShadow: '0 8px 32px var(--c-shadow)' },
   authBrand: { display: 'flex', alignItems: 'center', gap: 12, marginBottom: 28 },
-  authTitle: { fontFamily: fonts.display, fontSize: 34, fontWeight: 400, letterSpacing: '-0.025em', lineHeight: 1.05, margin: '0 0 6px', fontVariationSettings: '"opsz" 144' },
+  authTitle: { fontFamily: fonts.display, fontSize: 28, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.15, margin: '0 0 6px' },
   authSub: { fontSize: 13.5, color: colors.muted, marginBottom: 22, lineHeight: 1.5 },
   authError: { padding: '10px 14px', background: 'var(--c-red-bg)', color: 'var(--c-error-text)', borderRadius: 4, fontSize: 13, marginTop: 16, border: `1px solid var(--c-red-bg)` },
 
