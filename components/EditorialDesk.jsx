@@ -8,8 +8,9 @@ import {
   ArrowRight, Save, Download, MoreHorizontal, Sparkles,
   ExternalLink, FileCode, GraduationCap, Beaker, Wand2,
   MessageSquare, Lightbulb, RotateCcw, Network, Globe,
-  Zap, Rocket, Eye, Menu
+  Zap, Rocket, Eye, Menu, Home, Calendar, TrendingUp
 } from 'lucide-react';
+import { EVERGREEN_BLUEPRINT } from '../lib/evergreenBlueprint';
 
 // ============================================================================
 // DEFAULTS
@@ -316,7 +317,7 @@ function mdToHtml(md) {
 // ============================================================================
 
 export default function EditorialDesk() {
-  const [view, setView] = useState('evergreen');
+  const [view, setView] = useState('dashboard');
   const [topics, setTopics] = useState([]);
   const [drafts, setDrafts] = useState([]);
   const [libraryItems, setLibraryItems] = useState([]);
@@ -698,6 +699,37 @@ export default function EditorialDesk() {
     out += `  "We have an article on iron deficiency: Iron Deficiency Symptoms in Women."\n\n`;
     out += `If a target page's topic is clearly covered in your article (mentioned by name or addressed at length), you MUST link to it. Failing to add the required number of inline links is a formatting violation.\n`;
     return out;
+  };
+
+  // ---- load the evergreen topical authority blueprint ----
+  const loadEvergreenBlueprint = () => {
+    // Skip ones already in topics (by title match, evergreen only)
+    const existing = new Set(topics.filter(t => t.type === 'evergreen').map(t => t.title.toLowerCase().trim()));
+    const newOnes = EVERGREEN_BLUEPRINT.filter(b => !existing.has(b.title.toLowerCase().trim()));
+    if (newOnes.length === 0) {
+      showToast('All blueprint topics are already loaded', 'info');
+      return;
+    }
+    const stamped = newOnes.map(b => ({
+      id: uid(),
+      type: 'evergreen',
+      title: b.title,
+      keyword: b.keyword,
+      cluster: b.cluster,
+      category: b.category,
+      angle: `Comprehensive evergreen guide for the ${b.cluster} cluster. Anchor article aiming for topical authority on "${b.keyword}".`,
+      whyEvergreen: `Long-tail evergreen — readers searching this question will keep landing here for years. Part of the ${b.cluster} cluster building topical authority for ${b.category}.`,
+      status: 'pending',
+      source: 'blueprint',
+      createdAt: Date.now(),
+    }));
+    setTopics(prev => {
+      const next = [...stamped, ...prev];
+      storage.set('topics', next);
+      return next;
+    });
+    logAction('topic.generate', { count: stamped.length, type: 'evergreen', source: 'blueprint' });
+    showToast(`Loaded ${stamped.length} blueprint topics`, 'success');
   };
 
   // ---- generate topics ----
@@ -1124,6 +1156,16 @@ Return ONLY a JSON array (no preamble, no fences):
       <div style={styles.mainArea}>
         <TopBar onMenuClick={() => setSidebarOpen(true)} currentView={view} />
         <main style={styles.main}>
+        {view === 'dashboard' && (
+          <DashboardView
+            libraryItems={libraryItems}
+            drafts={drafts}
+            topics={topics}
+            currentUser={authStatus.user}
+            setView={setView}
+          />
+        )}
+
         {view === 'sitemap' && (
           <SitemapView
             sitePages={sitePages}
@@ -1134,6 +1176,8 @@ Return ONLY a JSON array (no preamble, no fences):
             onBulkAdd={() => setModal({ type: 'bulkSitePages' })}
             onEdit={(page) => setModal({ type: 'editSitePage', page })}
             onDelete={deleteSitePage}
+            onLoadBlueprint={loadEvergreenBlueprint}
+            canApprove={canApprove}
             onUpdateCluster={(item, kind, cluster) => {
               if (kind === 'topic') updateTopic(item.id, { cluster });
               else if (kind === 'draft') updateDraft(item.id, { cluster });
@@ -1485,6 +1529,12 @@ function Sidebar({ view, setView, counts, currentUser, onLogout, theme, onToggle
 
   const sections = [
     {
+      label: 'Overview',
+      items: [
+        { id: 'dashboard', label: 'Dashboard', icon: Home },
+      ],
+    },
+    {
       label: 'Content',
       items: [
         { id: 'sitemap', label: 'Sitemap', icon: Network, badge: counts.sitemap },
@@ -1597,6 +1647,7 @@ function Sidebar({ view, setView, counts, currentUser, onLogout, theme, onToggle
 
 function TopBar({ onMenuClick, currentView }) {
   const viewTitles = {
+    dashboard: 'Dashboard',
     sitemap: 'Sitemap',
     evergreen: 'Evergreen',
     news: 'News',
@@ -3740,12 +3791,278 @@ function ReportsView({ showToast }) {
 }
 
 // ============================================================================
+// DASHBOARD VIEW — daily targets + monthly progress
+// ============================================================================
+
+const DAILY_TARGETS = {
+  evergreen: { daily: 2, label: 'Evergreen', icon: Sprout, color: 'var(--c-green)', bg: 'var(--c-green-bg)', accent: '#5B8A78' },
+  news: { daily: 4, label: 'News', icon: Newspaper, color: 'var(--c-ochre)', bg: 'var(--c-ochre-bg)', accent: '#C77D4A' },
+  mythbusting: { daily: 2, label: 'Mythbust', icon: Zap, color: 'var(--c-red)', bg: 'var(--c-red-bg)', accent: '#A14438' },
+};
+
+function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const todayEnd = todayStart + 24 * 60 * 60 * 1000;
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime();
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const dayOfMonth = now.getDate();
+  const monthName = now.toLocaleDateString('en-ZA', { month: 'long', year: 'numeric' });
+  const dayName = now.toLocaleDateString('en-ZA', { weekday: 'long' });
+  const dateStr = now.toLocaleDateString('en-ZA', { day: 'numeric', month: 'long' });
+
+  // Helper: deployed = library item with deployed=true (i.e. pushed to WP)
+  const isDeployed = (item) => item.deployed && item.deployedAt;
+
+  // Counts per type — today
+  const deployedTodayByType = {};
+  // Counts per type — month
+  const deployedMonthByType = {};
+  // Counts per day of month (across all types)
+  const deployedByDay = {};
+
+  Object.keys(DAILY_TARGETS).forEach(type => {
+    deployedTodayByType[type] = 0;
+    deployedMonthByType[type] = 0;
+  });
+
+  libraryItems.forEach(item => {
+    if (!isDeployed(item)) return;
+    const type = item.type;
+    if (!DAILY_TARGETS[type]) return;
+    if (item.deployedAt >= todayStart && item.deployedAt < todayEnd) {
+      deployedTodayByType[type]++;
+    }
+    if (item.deployedAt >= monthStart && item.deployedAt < monthEnd) {
+      deployedMonthByType[type]++;
+      const day = new Date(item.deployedAt).getDate();
+      deployedByDay[day] = (deployedByDay[day] || 0) + 1;
+    }
+  });
+
+  // Day complete = all categories hit their daily target
+  const dayComplete = Object.entries(DAILY_TARGETS).every(([type, t]) => deployedTodayByType[type] >= t.daily);
+  const totalDeployedToday = Object.values(deployedTodayByType).reduce((s, n) => s + n, 0);
+  const totalDailyTarget = Object.values(DAILY_TARGETS).reduce((s, t) => s + t.daily, 0);
+
+  // Pending work counts — anything not yet deployed
+  const draftCount = drafts.length;
+  const pendingTopicsCount = topics.filter(t => t.status === 'pending').length;
+  const readyCount = libraryItems.filter(i => !i.deployed).length;
+
+  return (
+    <>
+      <div style={styles.dashTopRow}>
+        <div>
+          <div style={styles.dashEyebrow}>Today</div>
+          <h1 style={styles.dashHeadline}>{dayName}, {dateStr}</h1>
+          {currentUser && <div style={styles.dashGreeting}>Hi {currentUser.name?.split(' ')[0] || currentUser.username} 👋</div>}
+        </div>
+        {dayComplete ? (
+          <div style={styles.dayCompleteBadge}>
+            <div style={styles.dayCompleteTick}><Check size={20} strokeWidth={3} /></div>
+            <div>
+              <div style={styles.dayCompleteTitle}>Day complete</div>
+              <div style={styles.dayCompleteSub}>All daily targets met</div>
+            </div>
+          </div>
+        ) : (
+          <div style={styles.dayProgressBadge}>
+            <div style={styles.dayProgressNum}>{totalDeployedToday}<span style={styles.dayProgressOf}>/{totalDailyTarget}</span></div>
+            <div style={styles.dayProgressLabel}>deployed today</div>
+          </div>
+        )}
+      </div>
+
+      {/* Daily target cards */}
+      <div style={styles.dashCards}>
+        {Object.entries(DAILY_TARGETS).map(([type, t]) => {
+          const todayCount = deployedTodayByType[type];
+          const outstanding = Math.max(0, t.daily - todayCount);
+          const isComplete = todayCount >= t.daily;
+          const monthCount = deployedMonthByType[type];
+          const monthTarget = t.daily * daysInMonth;
+          const monthExpected = t.daily * dayOfMonth;
+          const monthPct = Math.min(100, Math.round((monthCount / monthTarget) * 100));
+          const onPace = monthCount >= monthExpected;
+          const Icon = t.icon;
+
+          return (
+            <div key={type} style={{ ...styles.dashCard, ...(isComplete ? styles.dashCardComplete : {}) }}>
+              <div style={styles.dashCardHeader}>
+                <div style={{ ...styles.dashCardIcon, color: t.color, background: t.bg }}>
+                  <Icon size={18} strokeWidth={2} />
+                </div>
+                <div style={styles.dashCardLabel}>{t.label}</div>
+                {isComplete && (
+                  <div style={styles.dashCardTick} title="Daily target met">
+                    <Check size={14} strokeWidth={3} />
+                  </div>
+                )}
+              </div>
+
+              <div style={styles.dashCardMainRow}>
+                <div style={styles.dashCardBigNum}>
+                  {todayCount}<span style={styles.dashCardSlash}>/{t.daily}</span>
+                </div>
+                <div style={styles.dashCardStatus}>
+                  {isComplete
+                    ? <span style={styles.dashCardOk}>complete</span>
+                    : <span style={styles.dashCardOutstanding}>{outstanding} outstanding</span>}
+                </div>
+              </div>
+
+              <div style={styles.dashProgressTrack}>
+                <div style={{
+                  ...styles.dashProgressFill,
+                  width: `${Math.min(100, (todayCount / t.daily) * 100)}%`,
+                  background: isComplete ? 'var(--c-green)' : t.color,
+                }} />
+              </div>
+
+              <div style={styles.dashCardMonthly}>
+                <div style={styles.dashCardMonthlyRow}>
+                  <span style={styles.dashCardMonthlyLabel}>This month</span>
+                  <span style={styles.dashCardMonthlyVal}>{monthCount} / {monthTarget}</span>
+                </div>
+                <div style={styles.dashMonthlyTrack}>
+                  <div style={{ ...styles.dashMonthlyFill, width: `${monthPct}%`, background: t.color }} />
+                  {/* Expected-by-now marker */}
+                  <div style={{
+                    ...styles.dashMonthlyMarker,
+                    left: `${Math.min(100, (monthExpected / monthTarget) * 100)}%`,
+                  }} title={`Expected by day ${dayOfMonth}: ${monthExpected}`} />
+                </div>
+                <div style={{ ...styles.dashCardPace, color: onPace ? 'var(--c-green)' : 'var(--c-ochre)' }}>
+                  {onPace ? `on pace` : `${monthExpected - monthCount} behind pace`}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Quick links — what's outstanding */}
+      <div style={styles.dashStatsStrip}>
+        <DashStat label="Pending topics" value={pendingTopicsCount} onClick={() => setView('evergreen')} />
+        <DashStat label="Drafts to review" value={draftCount} onClick={() => setView('evergreen')} />
+        <DashStat label="Ready to publish" value={readyCount} onClick={() => setView('library')} />
+        <DashStat label="Total deployed" value={libraryItems.filter(i => i.deployed).length} />
+      </div>
+
+      {/* Monthly heatmap */}
+      <section style={styles.dashSection}>
+        <div style={styles.dashSectionHead}>
+          <Calendar size={16} style={{ color: 'var(--c-muted)' }} />
+          <h2 style={styles.dashSectionTitle}>{monthName}</h2>
+          <span style={styles.dashSectionSub}>· deployments per day</span>
+        </div>
+        <MonthHeatmap
+          daysInMonth={daysInMonth}
+          dayOfMonth={dayOfMonth}
+          deployedByDay={deployedByDay}
+          dailyTotalTarget={totalDailyTarget}
+          firstDayOfMonth={new Date(now.getFullYear(), now.getMonth(), 1).getDay()}
+        />
+      </section>
+    </>
+  );
+}
+
+function DashStat({ label, value, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={!onClick}
+      style={{ ...styles.dashStatBtn, ...(onClick ? {} : { cursor: 'default' }) }}
+    >
+      <div style={styles.dashStatValue}>{value}</div>
+      <div style={styles.dashStatLabel}>{label}</div>
+    </button>
+  );
+}
+
+function MonthHeatmap({ daysInMonth, dayOfMonth, deployedByDay, dailyTotalTarget, firstDayOfMonth }) {
+  // Build grid: pad with empty cells before day 1 to align by weekday
+  const cells = [];
+  for (let i = 0; i < firstDayOfMonth; i++) cells.push({ pad: true });
+  for (let d = 1; d <= daysInMonth; d++) {
+    const count = deployedByDay[d] || 0;
+    const isToday = d === dayOfMonth;
+    const isPast = d < dayOfMonth;
+    const isFuture = d > dayOfMonth;
+    const pct = count / dailyTotalTarget;
+    let intensity = 'none';
+    if (count > 0 && pct < 0.5) intensity = 'low';
+    else if (count > 0 && pct < 1) intensity = 'mid';
+    else if (count >= dailyTotalTarget) intensity = 'full';
+    cells.push({ day: d, count, isToday, isPast, isFuture, intensity });
+  }
+  return (
+    <div>
+      <div style={styles.heatmapWeekdays}>
+        {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, i) => (
+          <div key={i} style={styles.heatmapWeekday}>{d}</div>
+        ))}
+      </div>
+      <div style={styles.heatmapGrid}>
+        {cells.map((c, i) => {
+          if (c.pad) return <div key={`pad-${i}`} style={styles.heatmapCellPad} />;
+          const style = {
+            ...styles.heatmapCell,
+            ...(styles[`heatmap_${c.intensity}`] || {}),
+            ...(c.isFuture ? styles.heatmapCellFuture : {}),
+            ...(c.isToday ? styles.heatmapCellToday : {}),
+          };
+          return (
+            <div key={c.day} style={style} title={`Day ${c.day}: ${c.count} deployed`}>
+              <span style={styles.heatmapCellDay}>{c.day}</span>
+              {c.count > 0 && <span style={styles.heatmapCellCount}>{c.count}</span>}
+            </div>
+          );
+        })}
+      </div>
+      <div style={styles.heatmapLegend}>
+        <span style={styles.heatmapLegendLabel}>Coverage</span>
+        <div style={{ ...styles.heatmapCell, ...styles.heatmap_none, width: 14, height: 14 }} />
+        <div style={{ ...styles.heatmapCell, ...styles.heatmap_low, width: 14, height: 14 }} />
+        <div style={{ ...styles.heatmapCell, ...styles.heatmap_mid, width: 14, height: 14 }} />
+        <div style={{ ...styles.heatmapCell, ...styles.heatmap_full, width: 14, height: 14 }} />
+        <span style={styles.heatmapLegendLabel}>Target met</span>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // SITEMAP / TOPICAL AUTHORITY
 // ============================================================================
 
-function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster }) {
+function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster, onLoadBlueprint, canApprove }) {
   const [viewMode, setViewMode] = useState('list'); // 'list' | 'visual'
   const [collapsed, setCollapsed] = useState({});
+  const [typeFilter, setTypeFilter] = useState('evergreen'); // 'all' | 'evergreen' | 'news' | 'mythbusting'
+
+  // Count blueprint progress for the planning banner
+  const blueprintCounts = (() => {
+    // Match by title — any evergreen topic with a matching title to the blueprint counts
+    const evergreenTopics = topics.filter(t => t.type === 'evergreen');
+    const loaded = EVERGREEN_BLUEPRINT.filter(b =>
+      evergreenTopics.some(t => t.title.toLowerCase().trim() === b.title.toLowerCase().trim())
+    ).length;
+    // Written = a matching draft or library item exists
+    const written = EVERGREEN_BLUEPRINT.filter(b => {
+      const lowerTitle = b.title.toLowerCase().trim();
+      return drafts.some(d => d.title.toLowerCase().trim() === lowerTitle)
+        || libraryItems.some(l => l.title.toLowerCase().trim() === lowerTitle);
+    }).length;
+    const deployed = EVERGREEN_BLUEPRINT.filter(b => {
+      const lowerTitle = b.title.toLowerCase().trim();
+      return libraryItems.some(l => l.deployed && l.title.toLowerCase().trim() === lowerTitle);
+    }).length;
+    return { total: EVERGREEN_BLUEPRINT.length, loaded, written, deployed };
+  })();
 
   // Aggregate everything into clusters
   const clusters = {};
@@ -3760,12 +4077,13 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
                 : 'ready';
     clusters[c][bucket].push({ ...item, kind, _status: status });
   };
+  // sitePages have no type — always include
   sitePages.forEach(p => addToCluster(p, 'LIVE', 'page'));
-  topics.filter(t => ['pending', 'writing', 'written'].includes(t.status)).forEach(t => {
+  topics.filter(t => ['pending', 'writing', 'written'].includes(t.status) && (typeFilter === 'all' || t.type === typeFilter)).forEach(t => {
     addToCluster(t, t.status === 'writing' ? 'WRITING' : 'PLANNED', 'topic');
   });
-  drafts.forEach(d => addToCluster(d, 'DRAFT', 'draft'));
-  libraryItems.forEach(l => addToCluster(l, l.deployed ? 'DEPLOYED' : 'READY', 'library'));
+  drafts.filter(d => typeFilter === 'all' || d.type === typeFilter).forEach(d => addToCluster(d, 'DRAFT', 'draft'));
+  libraryItems.filter(l => typeFilter === 'all' || l.type === typeFilter).forEach(l => addToCluster(l, l.deployed ? 'DEPLOYED' : 'READY', 'library'));
 
   // Sort clusters: most items first, "Unclustered" last
   const clusterEntries = Object.entries(clusters).sort((a, b) => {
@@ -3797,7 +4115,7 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
       <PageHead
         eyebrow="00 · Topical authority"
         title="Sitemap"
-        sub="Visual map of every page — live, planned, written, deployed. Generation references this to avoid cannibalisation."
+        sub="Plan the ideal evergreen sitemap, then work the editor toward it. Colour shifts as each topic moves through generation, drafting, and deployment."
         action={
           <div style={{ display: 'flex', gap: 8 }}>
             <button style={styles.secondaryBtn} onClick={onBulkAdd}>
@@ -3810,6 +4128,13 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
         }
       />
 
+      {/* Planning banner — evergreen blueprint progress */}
+      <BlueprintBanner
+        counts={blueprintCounts}
+        onLoad={onLoadBlueprint}
+        canApprove={canApprove}
+      />
+
       {/* Stats strip */}
       <div style={styles.statsStrip}>
         <SitemapStat label="Clusters" value={clusterEntries.length} />
@@ -3818,6 +4143,24 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
         <SitemapStat label="In draft" value={totalDraft} accent={STATUS_COLORS.DRAFT.bg} />
         <SitemapStat label="Ready" value={totalReady} accent={STATUS_COLORS.READY.bg} />
         <SitemapStat label="Deployed" value={totalDeployed} accent={STATUS_COLORS.DEPLOYED.bg} />
+      </div>
+
+      {/* Type filter */}
+      <div style={styles.typeFilterRow}>
+        {[
+          { id: 'evergreen', label: 'Evergreen', count: topics.filter(t => t.type === 'evergreen').length + drafts.filter(d => d.type === 'evergreen').length + libraryItems.filter(l => l.type === 'evergreen').length },
+          { id: 'news', label: 'News', count: topics.filter(t => t.type === 'news').length + drafts.filter(d => d.type === 'news').length + libraryItems.filter(l => l.type === 'news').length },
+          { id: 'mythbusting', label: 'Mythbust', count: topics.filter(t => t.type === 'mythbusting').length + drafts.filter(d => d.type === 'mythbusting').length + libraryItems.filter(l => l.type === 'mythbusting').length },
+          { id: 'all', label: 'All types', count: topics.length + drafts.length + libraryItems.length },
+        ].map(f => (
+          <button
+            key={f.id}
+            onClick={() => setTypeFilter(f.id)}
+            style={{ ...styles.filterBtn, ...(typeFilter === f.id ? styles.filterBtnActive : {}) }}
+          >
+            {f.label} <span style={styles.filterCount}>{f.count}</span>
+          </button>
+        ))}
       </div>
 
       {/* View toggle and legend */}
@@ -3941,6 +4284,54 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
         />
       )}
     </>
+  );
+}
+
+function BlueprintBanner({ counts, onLoad, canApprove }) {
+  const { total, loaded, written, deployed } = counts;
+  const fullyLoaded = loaded >= total;
+  const loadedPct = Math.round((loaded / total) * 100);
+  const writtenPct = Math.round((written / total) * 100);
+  const deployedPct = Math.round((deployed / total) * 100);
+
+  return (
+    <div style={styles.bpBanner}>
+      <div style={styles.bpBannerLeft}>
+        <div style={styles.bpBannerIcon}><Network size={22} /></div>
+        <div>
+          <div style={styles.bpBannerEyebrow}>Topical authority blueprint · Evergreen</div>
+          <div style={styles.bpBannerTitle}>{total} planned topics across 5 categories</div>
+          <div style={styles.bpBannerSub}>
+            {fullyLoaded
+              ? `${loaded} loaded · ${written} written · ${deployed} deployed`
+              : `${loaded} of ${total} loaded into pipeline. Click load to add the rest.`
+            }
+          </div>
+        </div>
+      </div>
+      <div style={styles.bpBannerRight}>
+        <div style={styles.bpProgressBlock}>
+          <div style={styles.bpProgressBars}>
+            <div title={`Loaded: ${loaded}/${total} (${loadedPct}%)`} style={{ ...styles.bpBar, ...styles.bpBarLoaded, width: `${loadedPct}%` }} />
+          </div>
+          <div style={styles.bpProgressBars}>
+            <div title={`Written: ${written}/${total} (${writtenPct}%)`} style={{ ...styles.bpBar, ...styles.bpBarWritten, width: `${writtenPct}%` }} />
+          </div>
+          <div style={styles.bpProgressBars}>
+            <div title={`Deployed: ${deployed}/${total} (${deployedPct}%)`} style={{ ...styles.bpBar, ...styles.bpBarDeployed, width: `${deployedPct}%` }} />
+          </div>
+        </div>
+        {canApprove && (
+          <button
+            onClick={onLoad}
+            disabled={fullyLoaded}
+            style={{ ...styles.primaryBtn, ...(fullyLoaded ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
+          >
+            {fullyLoaded ? <><Check size={15} /> All loaded</> : <><Download size={15} /> Load blueprint</>}
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -4565,6 +4956,95 @@ const styles = {
   treePageLink: { color: colors.muted, display: 'flex', alignItems: 'center', textDecoration: 'none', padding: 2 },
   treePageActions: { display: 'flex', gap: 2 },
   iconBtnSm: { background: 'transparent', border: 'none', color: colors.muted, padding: 3, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 3 },
+
+  // === BLUEPRINT BANNER ===
+  bpBanner: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 20, padding: '18px 22px', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 8, marginBottom: 18 },
+  bpBannerLeft: { display: 'flex', alignItems: 'center', gap: 14, flex: '1 1 320px', minWidth: 0 },
+  bpBannerIcon: { width: 44, height: 44, borderRadius: 8, background: 'var(--c-blue-bg)', color: 'var(--c-blue)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  bpBannerEyebrow: { fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase', color: colors.muted, fontWeight: 600, marginBottom: 2 },
+  bpBannerTitle: { fontFamily: fonts.display, fontSize: 17, fontWeight: 600, color: colors.ink, letterSpacing: '-0.012em' },
+  bpBannerSub: { fontSize: 12.5, color: colors.muted, marginTop: 3 },
+  bpBannerRight: { display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' },
+  bpProgressBlock: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 200 },
+  bpProgressBars: { height: 4, background: colors.bg, borderRadius: 999, overflow: 'hidden', position: 'relative' },
+  bpBar: { height: '100%', borderRadius: 999 },
+  bpBarLoaded: { background: 'var(--c-ochre)' },
+  bpBarWritten: { background: 'var(--c-blue)' },
+  bpBarDeployed: { background: 'var(--c-green)' },
+
+  // Type filter row in sitemap
+  typeFilterRow: { display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 18 },
+
+  // === DASHBOARD ===
+  dashTopRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 20, marginBottom: 32, paddingBottom: 24, borderBottom: `1px solid ${colors.border}` },
+  dashEyebrow: { fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase', color: colors.muted, fontWeight: 600, marginBottom: 6 },
+  dashHeadline: { fontFamily: fonts.display, fontSize: 32, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.1, margin: 0, color: colors.ink },
+  dashGreeting: { fontSize: 14, color: colors.muted, marginTop: 8 },
+
+  dayCompleteBadge: { display: 'flex', alignItems: 'center', gap: 14, padding: '14px 18px', background: 'var(--c-success-bg)', border: `1px solid var(--c-success-border)`, borderRadius: 8 },
+  dayCompleteTick: { width: 38, height: 38, borderRadius: '50%', background: 'var(--c-green)', color: '#FFFFFF', display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  dayCompleteTitle: { fontSize: 15, fontWeight: 600, color: 'var(--c-success-text)', lineHeight: 1.2 },
+  dayCompleteSub: { fontSize: 12, color: 'var(--c-success-text)', opacity: 0.8, marginTop: 2 },
+
+  dayProgressBadge: { textAlign: 'right' },
+  dayProgressNum: { fontFamily: fonts.display, fontSize: 32, fontWeight: 600, color: colors.ink, letterSpacing: '-0.02em', lineHeight: 1 },
+  dayProgressOf: { color: colors.muted, fontSize: 22, fontWeight: 500 },
+  dayProgressLabel: { fontSize: 11, color: colors.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 4, fontWeight: 600 },
+
+  dashCards: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 16, marginBottom: 24 },
+  dashCard: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 8, padding: '18px 20px 16px', transition: 'border-color 0.15s' },
+  dashCardComplete: { borderColor: 'var(--c-success-border)', background: 'var(--c-success-bg)' },
+  dashCardHeader: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 },
+  dashCardIcon: { width: 32, height: 32, borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  dashCardLabel: { fontSize: 13.5, fontWeight: 600, color: colors.ink, flex: 1, letterSpacing: '-0.005em' },
+  dashCardTick: { width: 24, height: 24, borderRadius: '50%', background: 'var(--c-green)', color: '#FFFFFF', display: 'flex', alignItems: 'center', justifyContent: 'center' },
+
+  dashCardMainRow: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 10 },
+  dashCardBigNum: { fontFamily: fonts.display, fontSize: 34, fontWeight: 600, color: colors.ink, lineHeight: 1, letterSpacing: '-0.02em' },
+  dashCardSlash: { color: colors.muted, fontSize: 18, fontWeight: 500 },
+  dashCardStatus: { fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' },
+  dashCardOk: { color: 'var(--c-green)' },
+  dashCardOutstanding: { color: colors.ochre },
+
+  dashProgressTrack: { height: 6, background: colors.bg, borderRadius: 999, overflow: 'hidden', marginBottom: 14 },
+  dashProgressFill: { height: '100%', borderRadius: 999, transition: 'width 0.3s ease' },
+
+  dashCardMonthly: { borderTop: `1px solid ${colors.borderSoft}`, paddingTop: 10 },
+  dashCardMonthlyRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  dashCardMonthlyLabel: { fontSize: 11.5, color: colors.muted, fontWeight: 500 },
+  dashCardMonthlyVal: { fontSize: 12, fontWeight: 600, color: colors.ink, fontVariantNumeric: 'tabular-nums' },
+  dashMonthlyTrack: { position: 'relative', height: 4, background: colors.bg, borderRadius: 999, overflow: 'visible', marginBottom: 6 },
+  dashMonthlyFill: { height: '100%', borderRadius: 999, opacity: 0.7 },
+  dashMonthlyMarker: { position: 'absolute', top: -2, width: 2, height: 8, background: colors.inkSoft, borderRadius: 1, opacity: 0.5 },
+  dashCardPace: { fontSize: 10.5, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', marginTop: 4 },
+
+  // Stat strip
+  dashStatsStrip: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8, marginBottom: 32 },
+  dashStatBtn: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, padding: '14px 16px', textAlign: 'left', fontFamily: fonts.body, color: colors.ink },
+  dashStatValue: { fontFamily: fonts.display, fontSize: 22, fontWeight: 600, color: colors.ink, lineHeight: 1, marginBottom: 4 },
+  dashStatLabel: { fontSize: 11.5, color: colors.muted, letterSpacing: '0.02em' },
+
+  // Monthly heatmap
+  dashSection: { marginBottom: 32 },
+  dashSectionHead: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 },
+  dashSectionTitle: { fontFamily: fonts.display, fontSize: 18, fontWeight: 600, color: colors.ink, margin: 0, letterSpacing: '-0.015em' },
+  dashSectionSub: { fontSize: 12, color: colors.muted },
+
+  heatmapWeekdays: { display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, marginBottom: 4, maxWidth: 560 },
+  heatmapWeekday: { fontSize: 10, color: colors.muted, fontWeight: 600, textAlign: 'center', letterSpacing: '0.08em' },
+  heatmapGrid: { display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, maxWidth: 560 },
+  heatmapCellPad: { aspectRatio: '1', background: 'transparent' },
+  heatmapCell: { aspectRatio: '1', borderRadius: 4, background: colors.bg, border: `1px solid ${colors.borderSoft}`, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', position: 'relative' },
+  heatmap_none: { background: colors.bg, border: `1px solid ${colors.borderSoft}` },
+  heatmap_low: { background: 'var(--c-green-bg)', border: `1px solid var(--c-success-border)` },
+  heatmap_mid: { background: 'var(--c-green)', opacity: 0.5, border: `1px solid var(--c-green)` },
+  heatmap_full: { background: 'var(--c-green)', border: `1px solid var(--c-green-deep)` },
+  heatmapCellFuture: { opacity: 0.35 },
+  heatmapCellToday: { boxShadow: `0 0 0 2px var(--c-ochre)`, fontWeight: 700 },
+  heatmapCellDay: { fontSize: 11, fontWeight: 600, color: colors.inkSoft, lineHeight: 1 },
+  heatmapCellCount: { fontSize: 9, color: 'var(--c-green-deep)', fontWeight: 700, marginTop: 1 },
+  heatmapLegend: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 12, fontSize: 11, color: colors.muted },
+  heatmapLegendLabel: { fontSize: 10.5, fontWeight: 500 },
 
   // Learn-from-edits prompt
   learnPrompt: { padding: '32px 28px', textAlign: 'center', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 },
