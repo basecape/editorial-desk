@@ -401,14 +401,21 @@ export default function EditorialDesk() {
         storage.get('sitePages', []),
         storage.get('categoryTraining', DEFAULT_CATEGORY_TRAINING)
       ]);
-      // Migrate: any item without type becomes evergreen; old categories → new
+      // Migrate: any item without type becomes evergreen; legacy categories → new
+      const ALLOWED_CATEGORIES = new Set([
+        'fitness', 'nutrition', 'mental_health', 'health_guides', 'beauty',
+        'fitness_training', 'diet_nutrition', 'preventive_health',
+        'women_s_health', 'men_s_health', 'expert_directory', 'community_social',
+        'medications', 'supplements', 'tools_calculators', 'health_news',
+        'kids_family', 'my_health_profile',
+      ]);
       const migrateCategory = (cat) => {
         if (!cat) return 'health_guides';
         const c = String(cat).toLowerCase();
-        if (['fitness', 'nutrition', 'mental_health', 'health_guides', 'beauty'].includes(c)) return c;
+        if (ALLOWED_CATEGORIES.has(c)) return c;
         if (c === 'wellness') return 'health_guides';
-        if (c === 'mens' || c === "men's") return 'health_guides';
-        if (c === 'womens' || c === "women's") return 'health_guides';
+        if (c === 'mens' || c === "men's") return 'men_s_health';
+        if (c === 'womens' || c === "women's") return 'women_s_health';
         return 'health_guides';
       };
       setTopics(t.map(x => ({ ...x, type: x.type || 'evergreen', category: migrateCategory(x.category) })));
