@@ -3786,6 +3786,24 @@ function ReportsView({ showToast }) {
         eyebrow="08 · Reports"
         title="Reports"
         sub="Activity log and per-user stats. Filter by user, time range, or action family."
+        action={
+          <button
+            style={styles.secondaryBtn}
+            onClick={async () => {
+              if (!confirm('Clear the entire activity log? This cannot be undone.')) return;
+              try {
+                const res = await fetch('/api/activity', { method: 'DELETE', credentials: 'same-origin' });
+                if (!res.ok) throw new Error(await res.text());
+                setEvents([]);
+                showToast('Activity log cleared', 'success');
+              } catch (e) {
+                showToast('Clear failed: ' + e.message, 'error');
+              }
+            }}
+          >
+            <Trash2 size={14} /> Clear activity
+          </button>
+        }
       />
 
       {error && <div style={styles.authError}>{error}</div>}
