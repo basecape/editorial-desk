@@ -3643,47 +3643,29 @@ function TargetsEditor({ user, onSave }) {
   const defaults = { evergreen: 2, news: 4, mythbusting: 2 };
   const initial = user.dailyTargets || defaults;
   const [vals, setVals] = useState(initial);
-  const [dirty, setDirty] = useState(false);
 
-  const setField = (k, v) => {
-    const n = Math.max(0, Math.min(50, parseInt(v, 10) || 0));
-    const next = { ...vals, [k]: n };
+  const options = Array.from({ length: 11 }, (_, i) => i); // 0–10
+
+  const change = (k, v) => {
+    const next = { ...vals, [k]: parseInt(v, 10) };
     setVals(next);
-    setDirty(next.evergreen !== initial.evergreen || next.news !== initial.news || next.mythbusting !== initial.mythbusting);
+    onSave(next); // auto-save
   };
+
+  const TypePill = ({ k, label, color }) => (
+    <label style={styles.targetGroup}>
+      <span style={{ ...styles.targetTypeBadge, background: color, color: '#FFFFFF' }}>{label}</span>
+      <select value={vals[k]} onChange={e => change(k, e.target.value)} style={styles.targetSelect}>
+        {options.map(n => <option key={n} value={n}>{n}</option>)}
+      </select>
+    </label>
+  );
 
   return (
     <div style={styles.targetsEditor}>
-      <input
-        type="number" min={0} max={50}
-        value={vals.evergreen}
-        onChange={e => setField('evergreen', e.target.value)}
-        style={styles.targetInput}
-        title="Evergreen per day"
-      />
-      <input
-        type="number" min={0} max={50}
-        value={vals.news}
-        onChange={e => setField('news', e.target.value)}
-        style={styles.targetInput}
-        title="News per day"
-      />
-      <input
-        type="number" min={0} max={50}
-        value={vals.mythbusting}
-        onChange={e => setField('mythbusting', e.target.value)}
-        style={styles.targetInput}
-        title="Mythbust per day"
-      />
-      {dirty && (
-        <button
-          style={styles.targetSaveBtn}
-          onClick={() => { onSave(vals); setDirty(false); }}
-          title="Save targets"
-        >
-          <Save size={11} />
-        </button>
-      )}
+      <TypePill k="evergreen" label="E" color="#5B8A78" />
+      <TypePill k="news" label="N" color="#C77D4A" />
+      <TypePill k="mythbusting" label="M" color="#A14438" />
     </div>
   );
 }
@@ -5254,10 +5236,11 @@ const styles = {
   bulkPreviewMeta: { fontSize: 11, color: colors.faint, fontStyle: 'italic' },
   bulkPreviewMore: { fontSize: 11, color: colors.muted, fontStyle: 'italic', paddingTop: 4 },
 
-  // Targets editor in users table
-  targetsEditor: { display: 'flex', alignItems: 'center', gap: 4 },
-  targetInput: { width: 38, padding: '5px 4px', fontSize: 12.5, textAlign: 'center', border: `1px solid ${colors.border}`, borderRadius: 4, background: colors.inputBg, fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600 },
-  targetSaveBtn: { background: colors.green, color: '#FFFFFF', border: 'none', borderRadius: 4, padding: '5px 7px', display: 'flex', alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
+  // Targets editor in users table — coloured type pill + dropdown
+  targetsEditor: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  targetGroup: { display: 'inline-flex', alignItems: 'center', gap: 4, background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '2px 2px 2px 4px' },
+  targetTypeBadge: { fontSize: 9.5, fontWeight: 700, padding: '2px 5px', borderRadius: 3, letterSpacing: '0.05em', lineHeight: 1 },
+  targetSelect: { padding: '3px 4px 3px 6px', fontSize: 12.5, border: 'none', background: 'transparent', fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600, cursor: 'pointer', outline: 'none' },
 
   // === CATEGORY ACCORDION (topics + drafts) ===
   accordionToolbar: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, fontSize: 11.5, color: colors.muted },
