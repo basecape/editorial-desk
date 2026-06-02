@@ -4354,11 +4354,26 @@ function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDe
   });
 
   const CATEGORY_LABELS = {
+    // Original 5
     fitness: 'Fitness',
     nutrition: 'Nutrition',
-    mental_health: 'Mental health',
-    health_guides: 'Health guides',
+    mental_health: 'Mental Health',
+    health_guides: 'Health Guides',
     beauty: 'Beauty',
+    // Content Plan v3 — 14 sections
+    fitness_training: 'Fitness & Training',
+    diet_nutrition: 'Diet & Nutrition',
+    preventive_health: 'Preventive Health',
+    women_s_health: "Women's Health",
+    men_s_health: "Men's Health",
+    expert_directory: 'Expert Directory',
+    community_social: 'Community & Social',
+    medications: 'Medications',
+    supplements: 'Supplements',
+    tools_calculators: 'Tools & Calculators',
+    health_news: 'Health News',
+    kids_family: 'Kids & Family',
+    my_health_profile: 'My Health Profile',
     uncategorised: 'Uncategorised',
   };
 
@@ -4584,30 +4599,59 @@ function SitePageForm({ page, existingClusters, onSubmit, onClose }) {
 function BulkSitePagesForm({ onSubmit, onClose }) {
   const [text, setText] = useState('');
   const [defaultCluster, setDefaultCluster] = useState('');
+  const [defaultCategory, setDefaultCategory] = useState('');
 
-  const parse = () => {
-    // Each line: Title | URL | keyword | cluster
-    // Or simpler: Title | URL  (cluster falls back to defaultCluster)
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const pages = lines.map(line => {
-      const parts = line.split('|').map(p => p.trim());
+  // Smart parser: detects delimiter per line (tab, pipe, or 2+ spaces).
+  // Excel paste uses tabs; pipes work for manual entry.
+  const parseLines = (raw) => {
+    const lines = raw.split('\n').map(l => l).filter(l => l.trim());
+    return lines.map(line => {
+      let parts;
+      if (line.includes('\t')) parts = line.split('\t');
+      else if (line.includes('|')) parts = line.split('|');
+      else parts = [line]; // single column = title only
+      parts = parts.map(p => p.trim());
       return {
         title: parts[0] || '',
         url: parts[1] || '',
         keyword: parts[2] || '',
         cluster: parts[3] || defaultCluster || 'Unclustered',
+        category: (parts[4] || defaultCategory || '').toLowerCase().replace(/[\s-]/g, '_') || '',
       };
     }).filter(p => p.title);
-    if (pages.length) onSubmit(pages);
+  };
+
+  const preview = parseLines(text);
+
+  const submit = () => {
+    if (preview.length) onSubmit(preview);
   };
 
   return (
     <div style={styles.formPanel}>
       <h2 style={styles.formTitle}>Bulk add live pages</h2>
-      <p style={styles.formSub}>One page per line. Format: <code style={styles.mdCode}>Title | URL | keyword | cluster</code> — only Title is required. Use <code style={styles.mdCode}>|</code> between fields.</p>
+      <p style={styles.formSub}>
+        Paste rows from Excel (columns are auto-detected) or type by hand with <code style={styles.mdCode}>|</code> between fields.<br />
+        Order: <code style={styles.mdCode}>Title</code> · <code style={styles.mdCode}>URL</code> · <code style={styles.mdCode}>Keyword</code> · <code style={styles.mdCode}>Cluster</code> · <code style={styles.mdCode}>Category</code>. Only Title is required.
+      </p>
 
-      <label style={styles.formLabel}>Default cluster <span style={styles.optional}>used when a line has no cluster</span></label>
-      <input value={defaultCluster} onChange={e => setDefaultCluster(e.target.value)} style={styles.topicInput} placeholder="e.g. Diabetes" />
+      <div style={styles.bulkDefaultsRow}>
+        <div style={{ flex: 1 }}>
+          <label style={styles.formLabel}>Default cluster <span style={styles.optional}>fallback</span></label>
+          <input value={defaultCluster} onChange={e => setDefaultCluster(e.target.value)} style={styles.topicInput} placeholder="e.g. Diabetes" />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={styles.formLabel}>Default category <span style={styles.optional}>fallback</span></label>
+          <select value={defaultCategory} onChange={e => setDefaultCategory(e.target.value)} style={{ ...styles.topicInput, paddingRight: 14 }}>
+            <option value="">— none —</option>
+            <option value="fitness">Fitness</option>
+            <option value="nutrition">Nutrition</option>
+            <option value="mental_health">Mental health</option>
+            <option value="health_guides">Health guides</option>
+            <option value="beauty">Beauty</option>
+          </select>
+        </div>
+      </div>
 
       <label style={styles.formLabel}>Pages</label>
       <textarea
@@ -4615,15 +4659,36 @@ function BulkSitePagesForm({ onSubmit, onClose }) {
         onChange={e => setText(e.target.value)}
         style={{ ...styles.textarea, minHeight: 200, fontFamily: 'ui-monospace, monospace', fontSize: 13 }}
         rows={12}
-        placeholder={`Signs of type 2 diabetes | https://site.co.za/t2d-signs | type 2 diabetes signs | Diabetes
-Diabetes and SA medical aid | https://site.co.za/diabetes-aid | diabetes medical aid | Diabetes
-Menopause symptoms in your 40s | | menopause symptoms 40s | Menopause`}
+        placeholder={`Tip: Copy multiple cells in Excel/Sheets and paste here — tabs auto-detected.
+
+Signs of type 2 diabetes | https://site.co.za/t2d-signs | type 2 diabetes | Diabetes | health_guides
+Iron deficiency in women | https://site.co.za/iron-women | iron deficiency women | Vitamins & minerals | nutrition`}
       />
+
+      {preview.length > 0 && (
+        <div style={styles.bulkPreview}>
+          <div style={styles.bulkPreviewLabel}>Preview · {preview.length} {preview.length === 1 ? 'page' : 'pages'}</div>
+          <div style={styles.bulkPreviewList}>
+            {preview.slice(0, 8).map((p, i) => (
+              <div key={i} style={styles.bulkPreviewRow}>
+                <span style={styles.bulkPreviewTitle}>{p.title}</span>
+                {p.url && <span style={styles.bulkPreviewUrl}>{p.url}</span>}
+                {(p.cluster || p.category) && (
+                  <span style={styles.bulkPreviewMeta}>
+                    {p.cluster}{p.cluster && p.category ? ' · ' : ''}{p.category}
+                  </span>
+                )}
+              </div>
+            ))}
+            {preview.length > 8 && <div style={styles.bulkPreviewMore}>+{preview.length - 8} more</div>}
+          </div>
+        </div>
+      )}
 
       <div style={styles.formActions}>
         <button style={styles.secondaryBtn} onClick={onClose}>Cancel</button>
-        <button style={styles.primaryBtn} onClick={parse} disabled={!text.trim()}>
-          <Plus size={15} /> Add all
+        <button style={styles.primaryBtn} onClick={submit} disabled={!preview.length}>
+          <Plus size={15} /> Add {preview.length || ''} {preview.length === 1 ? 'page' : 'pages'}
         </button>
       </div>
     </div>
@@ -4956,6 +5021,17 @@ const styles = {
   treePageLink: { color: colors.muted, display: 'flex', alignItems: 'center', textDecoration: 'none', padding: 2 },
   treePageActions: { display: 'flex', gap: 2 },
   iconBtnSm: { background: 'transparent', border: 'none', color: colors.muted, padding: 3, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 3 },
+
+  // Bulk add improvements
+  bulkDefaultsRow: { display: 'flex', gap: 12, marginBottom: 6 },
+  bulkPreview: { marginTop: 14, padding: '12px 14px', background: colors.bg, border: `1px solid ${colors.borderSoft}`, borderRadius: 6 },
+  bulkPreviewLabel: { fontSize: 11, fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', color: colors.muted, marginBottom: 8 },
+  bulkPreviewList: { display: 'flex', flexDirection: 'column', gap: 5 },
+  bulkPreviewRow: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'baseline', fontSize: 12.5, paddingBottom: 5, borderBottom: `1px dashed ${colors.borderSoft}` },
+  bulkPreviewTitle: { fontWeight: 500, color: colors.ink, flex: '1 1 200px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  bulkPreviewUrl: { fontSize: 11.5, color: colors.muted, fontFamily: 'ui-monospace, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 },
+  bulkPreviewMeta: { fontSize: 11, color: colors.faint, fontStyle: 'italic' },
+  bulkPreviewMore: { fontSize: 11, color: colors.muted, fontStyle: 'italic', paddingTop: 4 },
 
   // === BLUEPRINT BANNER ===
   bpBanner: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 20, padding: '18px 22px', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 8, marginBottom: 18 },
