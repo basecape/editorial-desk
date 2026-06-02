@@ -1817,8 +1817,10 @@ function PipelineView({
                 : 'Switch filters or generate more topics.'}
             />
           ) : (
-            <div style={styles.topicListDense}>
-              {filteredTopics.map(t => (
+            <CategoryAccordion
+              items={filteredTopics}
+              storageKey={`acc-topics-${type}`}
+              renderRow={(t) => (
                 <TopicRow
                   key={t.id}
                   topic={t}
@@ -1828,8 +1830,8 @@ function PipelineView({
                   onDelete={() => onDeleteTopic(t.id)}
                   canApprove={canApprove}
                 />
-              ))}
-            </div>
+              )}
+            />
           )}
         </>
       )}
@@ -1856,8 +1858,10 @@ function PipelineView({
               hint="Approve a topic to send it to the writer. Drafts land here when ready."
             />
           ) : (
-            <div style={styles.draftList}>
-              {drafts.filter(d => filter === 'all' || d.status === filter).map(d => (
+            <CategoryAccordion
+              items={drafts.filter(d => filter === 'all' || d.status === filter)}
+              storageKey={`acc-drafts-${type}`}
+              renderRow={(d) => (
                 <DraftRow
                   key={d.id}
                   draft={d}
@@ -1867,12 +1871,104 @@ function PipelineView({
                   onDelete={() => onDeleteDraft(d.id)}
                   canApprove={canApprove}
                 />
-              ))}
-            </div>
+              )}
+            />
           )}
         </>
       )}
     </>
+  );
+}
+
+// ============================================================================
+// CATEGORY ACCORDION — groups items by category, collapsible sections
+// ============================================================================
+
+function CategoryAccordion({ items, renderRow, storageKey }) {
+  // Group by category
+  const grouped = {};
+  items.forEach(item => {
+    const key = item.category || 'uncategorised';
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(item);
+  });
+
+  // Sort categories: known ones first (in label order), unknowns alphabetically
+  const KNOWN_ORDER = [
+    'fitness_training', 'diet_nutrition', 'mental_health', 'preventive_health',
+    'women_s_health', 'men_s_health', 'medications', 'supplements',
+    'expert_directory', 'community_social', 'tools_calculators',
+    'health_news', 'kids_family', 'my_health_profile',
+    'fitness', 'nutrition', 'health_guides', 'beauty', 'uncategorised',
+  ];
+  const sortedKeys = Object.keys(grouped).sort((a, b) => {
+    const ai = KNOWN_ORDER.indexOf(a);
+    const bi = KNOWN_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+
+  // Collapsed state — persisted per storageKey
+  const [collapsed, setCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return {};
+    try {
+      const raw = localStorage.getItem(`accordion:${storageKey}`);
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  });
+
+  const toggle = (cat) => {
+    setCollapsed(prev => {
+      const next = { ...prev, [cat]: !prev[cat] };
+      try { localStorage.setItem(`accordion:${storageKey}`, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
+
+  const expandAll = () => {
+    const next = {};
+    sortedKeys.forEach(k => { next[k] = false; });
+    setCollapsed(next);
+    try { localStorage.setItem(`accordion:${storageKey}`, JSON.stringify(next)); } catch {}
+  };
+  const collapseAll = () => {
+    const next = {};
+    sortedKeys.forEach(k => { next[k] = true; });
+    setCollapsed(next);
+    try { localStorage.setItem(`accordion:${storageKey}`, JSON.stringify(next)); } catch {}
+  };
+
+  return (
+    <div>
+      {sortedKeys.length > 1 && (
+        <div style={styles.accordionToolbar}>
+          <button style={styles.accordionToolBtn} onClick={expandAll}>Expand all</button>
+          <span style={styles.accordionToolDot}>·</span>
+          <button style={styles.accordionToolBtn} onClick={collapseAll}>Collapse all</button>
+        </div>
+      )}
+      {sortedKeys.map(cat => {
+        const isCollapsed = !!collapsed[cat];
+        const groupItems = grouped[cat];
+        const label = CATEGORY_LABELS[cat] || cat;
+        return (
+          <div key={cat} style={styles.accordionGroup}>
+            <button onClick={() => toggle(cat)} style={styles.accordionHeader}>
+              {isCollapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+              <span style={styles.accordionTitle}>{label}</span>
+              <span style={styles.accordionCount}>{groupItems.length}</span>
+            </button>
+            {!isCollapsed && (
+              <div style={styles.accordionBody}>
+                {groupItems.map(item => renderRow(item))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -4353,30 +4449,6 @@ function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDe
     });
   });
 
-  const CATEGORY_LABELS = {
-    // Original 5
-    fitness: 'Fitness',
-    nutrition: 'Nutrition',
-    mental_health: 'Mental Health',
-    health_guides: 'Health Guides',
-    beauty: 'Beauty',
-    // Content Plan v3 — 14 sections
-    fitness_training: 'Fitness & Training',
-    diet_nutrition: 'Diet & Nutrition',
-    preventive_health: 'Preventive Health',
-    women_s_health: "Women's Health",
-    men_s_health: "Men's Health",
-    expert_directory: 'Expert Directory',
-    community_social: 'Community & Social',
-    medications: 'Medications',
-    supplements: 'Supplements',
-    tools_calculators: 'Tools & Calculators',
-    health_news: 'Health News',
-    kids_family: 'Kids & Family',
-    my_health_profile: 'My Health Profile',
-    uncategorised: 'Uncategorised',
-  };
-
   const sortedCategories = Object.keys(tree).sort((a, b) => {
     if (a === 'uncategorised') return 1;
     if (b === 'uncategorised') return -1;
@@ -4848,6 +4920,28 @@ const fonts = {
   body: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
 };
 
+const CATEGORY_LABELS = {
+  fitness: 'Fitness',
+  nutrition: 'Nutrition',
+  mental_health: 'Mental Health',
+  health_guides: 'Health Guides',
+  beauty: 'Beauty',
+  fitness_training: 'Fitness & Training',
+  diet_nutrition: 'Diet & Nutrition',
+  preventive_health: 'Preventive Health',
+  women_s_health: "Women's Health",
+  men_s_health: "Men's Health",
+  expert_directory: 'Expert Directory',
+  community_social: 'Community & Social',
+  medications: 'Medications',
+  supplements: 'Supplements',
+  tools_calculators: 'Tools & Calculators',
+  health_news: 'Health News',
+  kids_family: 'Kids & Family',
+  my_health_profile: 'My Health Profile',
+  uncategorised: 'Uncategorised',
+};
+
 const styles = {
   app: { minHeight: '100vh', background: colors.bg, color: colors.ink, fontFamily: fonts.body, fontSize: 14.5, lineHeight: 1.55 },
   loading: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: colors.bg },
@@ -5032,6 +5126,20 @@ const styles = {
   bulkPreviewUrl: { fontSize: 11.5, color: colors.muted, fontFamily: 'ui-monospace, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 },
   bulkPreviewMeta: { fontSize: 11, color: colors.faint, fontStyle: 'italic' },
   bulkPreviewMore: { fontSize: 11, color: colors.muted, fontStyle: 'italic', paddingTop: 4 },
+
+  // === CATEGORY ACCORDION (topics + drafts) ===
+  accordionToolbar: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, fontSize: 11.5, color: colors.muted },
+  accordionToolBtn: { background: 'transparent', border: 'none', padding: 0, color: colors.green, fontWeight: 500, fontFamily: fonts.body, fontSize: 11.5, textDecoration: 'underline', cursor: 'pointer' },
+  accordionToolDot: { color: colors.faint },
+  accordionGroup: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 6, marginBottom: 8, overflow: 'hidden' },
+  accordionHeader: {
+    display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+    padding: '12px 16px', background: colors.surface, border: 'none',
+    textAlign: 'left', fontFamily: fonts.body, color: colors.ink,
+  },
+  accordionTitle: { fontSize: 13.5, fontWeight: 600, flex: 1, letterSpacing: '-0.005em' },
+  accordionCount: { fontSize: 11, color: colors.muted, fontWeight: 600, padding: '2px 9px', background: colors.bg, borderRadius: 999, fontVariantNumeric: 'tabular-nums' },
+  accordionBody: { borderTop: `1px solid ${colors.borderSoft}`, padding: '4px 0 8px' },
 
   // === BLUEPRINT BANNER ===
   bpBanner: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 20, padding: '18px 22px', background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 8, marginBottom: 18 },
