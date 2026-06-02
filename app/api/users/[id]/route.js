@@ -33,6 +33,15 @@ export async function PATCH(req, { params }) {
     }
     updates.role = body.role;
   }
+  if (body.dailyTargets !== undefined) {
+    const t = body.dailyTargets || {};
+    const clean = {
+      evergreen: Math.max(0, Math.min(50, parseInt(t.evergreen, 10) || 0)),
+      news: Math.max(0, Math.min(50, parseInt(t.news, 10) || 0)),
+      mythbusting: Math.max(0, Math.min(50, parseInt(t.mythbusting, 10) || 0)),
+    };
+    updates.dailyTargets = clean;
+  }
   if (body.password !== undefined) {
     if (body.password.length < 8) {
       return new Response(JSON.stringify({ error: { message: 'Password must be at least 8 characters' } }), { status: 400, headers: { 'Content-Type': 'application/json' } });

@@ -504,7 +504,7 @@ export default function EditorialDesk() {
       return next;
     });
     deleteDraft(draft.id);
-    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type, learnedFromEdits: !!options.learnFromEdits });
+    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type, category: draft.category, learnedFromEdits: !!options.learnFromEdits });
     setModal(null);
     showToast('Published to library', 'success');
   };
@@ -627,7 +627,7 @@ export default function EditorialDesk() {
       const msg = chosenImage
         ? `Pushed to WordPress with image by ${chosenImage.photographer}`
         : 'Pushed to WordPress (no image — set PEXELS_API_KEY to auto-add)';
-      logAction('library.push_wp', { title: item.title, wpPostId: data.id, hasImage: !!chosenImage });
+      logAction('library.push_wp', { title: item.title, wpPostId: data.id, hasImage: !!chosenImage, type: item.type, category: item.category });
       showToast(msg, 'success');
     } catch (e) {
       setModal({ type: 'error', message: e.message });
@@ -3534,6 +3534,21 @@ function AdminView({ currentUser, showToast }) {
     } catch (e) { showToast(e.message, 'error'); }
   };
 
+  const updateTargets = async (id, dailyTargets) => {
+    try {
+      const res = await fetch(`/api/users/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ dailyTargets }),
+      });
+      const data = await res.json();
+      if (!res.ok) { showToast(data?.error?.message || 'Failed', 'error'); return; }
+      showToast(`Targets saved: ${dailyTargets.evergreen}E · ${dailyTargets.news}N · ${dailyTargets.mythbusting}M`, 'success');
+      loadUsers();
+    } catch (e) { showToast(e.message, 'error'); }
+  };
+
   const deleteUser = async (id, username) => {
     if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
     try {
@@ -3574,17 +3589,18 @@ function AdminView({ currentUser, showToast }) {
       ) : (
         <div style={styles.usersTable}>
           <div style={{ ...styles.usersRow, ...styles.usersHeader }}>
-            <div style={{ flex: 2 }}>Name</div>
-            <div style={{ flex: 1.5 }}>Username</div>
-            <div style={{ flex: 1.2 }}>Role</div>
-            <div style={{ flex: 1.5 }}>Last login</div>
+            <div style={{ flex: 1.6 }}>Name</div>
+            <div style={{ flex: 1.2 }}>Username</div>
+            <div style={{ flex: 1.1 }}>Role</div>
+            <div style={{ flex: 1.6 }}>Daily targets (E · N · M)</div>
+            <div style={{ flex: 1.2 }}>Last login</div>
             <div style={{ width: 40 }}></div>
           </div>
           {users.map(u => (
             <div key={u.id} style={styles.usersRow}>
-              <div style={{ flex: 2, fontWeight: 500 }}>{u.name}</div>
-              <div style={{ flex: 1.5, color: '#6B6657', fontFamily: 'ui-monospace, monospace', fontSize: 13 }}>{u.username}</div>
-              <div style={{ flex: 1.2 }}>
+              <div style={{ flex: 1.6, fontWeight: 500, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{u.name}</div>
+              <div style={{ flex: 1.2, color: colors.muted, fontFamily: 'ui-monospace, monospace', fontSize: 13, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{u.username}</div>
+              <div style={{ flex: 1.1 }}>
                 {u.id === currentUser.id ? (
                   <span style={styles.roleBadge(u.role)}>{u.role} (you)</span>
                 ) : (
@@ -3599,7 +3615,13 @@ function AdminView({ currentUser, showToast }) {
                   </select>
                 )}
               </div>
-              <div style={{ flex: 1.5, color: '#6B6657', fontSize: 13 }}>
+              <div style={{ flex: 1.6 }}>
+                <TargetsEditor
+                  user={u}
+                  onSave={(targets) => updateTargets(u.id, targets)}
+                />
+              </div>
+              <div style={{ flex: 1.2, color: colors.muted, fontSize: 12.5 }}>
                 {u.lastLoginAt ? timeAgo(u.lastLoginAt) : 'never'}
               </div>
               <div style={{ width: 40, textAlign: 'right' }}>
@@ -3614,6 +3636,55 @@ function AdminView({ currentUser, showToast }) {
         </div>
       )}
     </>
+  );
+}
+
+function TargetsEditor({ user, onSave }) {
+  const defaults = { evergreen: 2, news: 4, mythbusting: 2 };
+  const initial = user.dailyTargets || defaults;
+  const [vals, setVals] = useState(initial);
+  const [dirty, setDirty] = useState(false);
+
+  const setField = (k, v) => {
+    const n = Math.max(0, Math.min(50, parseInt(v, 10) || 0));
+    const next = { ...vals, [k]: n };
+    setVals(next);
+    setDirty(next.evergreen !== initial.evergreen || next.news !== initial.news || next.mythbusting !== initial.mythbusting);
+  };
+
+  return (
+    <div style={styles.targetsEditor}>
+      <input
+        type="number" min={0} max={50}
+        value={vals.evergreen}
+        onChange={e => setField('evergreen', e.target.value)}
+        style={styles.targetInput}
+        title="Evergreen per day"
+      />
+      <input
+        type="number" min={0} max={50}
+        value={vals.news}
+        onChange={e => setField('news', e.target.value)}
+        style={styles.targetInput}
+        title="News per day"
+      />
+      <input
+        type="number" min={0} max={50}
+        value={vals.mythbusting}
+        onChange={e => setField('mythbusting', e.target.value)}
+        style={styles.targetInput}
+        title="Mythbust per day"
+      />
+      {dirty && (
+        <button
+          style={styles.targetSaveBtn}
+          onClick={() => { onSave(vals); setDirty(false); }}
+          title="Save targets"
+        >
+          <Save size={11} />
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -3922,6 +3993,24 @@ const DAILY_TARGETS = {
 };
 
 function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
+  const [myEvents, setMyEvents] = useState([]);
+  const [activityLoaded, setActivityLoaded] = useState(false);
+
+  // Fetch this user's events from activity log
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/activity', { credentials: 'same-origin' });
+        if (!res.ok) { setActivityLoaded(true); return; }
+        const data = await res.json();
+        // For non-admin, the API already filters to own; for admin, filter client-side
+        const mine = (data.events || []).filter(e => e.userId === currentUser?.id);
+        setMyEvents(mine);
+      } catch {}
+      setActivityLoaded(true);
+    })();
+  }, [currentUser?.id]);
+
   const now = new Date();
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
   const todayEnd = todayStart + 24 * 60 * 60 * 1000;
@@ -3933,41 +4022,43 @@ function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
   const dayName = now.toLocaleDateString('en-ZA', { weekday: 'long' });
   const dateStr = now.toLocaleDateString('en-ZA', { day: 'numeric', month: 'long' });
 
-  // Helper: deployed = library item with deployed=true (i.e. pushed to WP)
-  const isDeployed = (item) => item.deployed && item.deployedAt;
+  // Personal daily targets (fall back to global defaults)
+  const PERSONAL_TARGETS = currentUser?.dailyTargets || { evergreen: 2, news: 4, mythbusting: 2 };
 
-  // Counts per type — today
+  // Helper: deploy events for this user in a time range, by type
+  const countEvents = (type, startMs, endMs) => myEvents.filter(e =>
+    e.action === 'library.push_wp' &&
+    e.timestamp >= startMs && e.timestamp < endMs &&
+    e.metadata?.type === type
+  ).length;
+
+  // Today & monthly counts per type for THIS user
   const deployedTodayByType = {};
-  // Counts per type — month
   const deployedMonthByType = {};
-  // Counts per day of month (across all types)
   const deployedByDay = {};
 
   Object.keys(DAILY_TARGETS).forEach(type => {
-    deployedTodayByType[type] = 0;
-    deployedMonthByType[type] = 0;
+    deployedTodayByType[type] = countEvents(type, todayStart, todayEnd);
+    deployedMonthByType[type] = countEvents(type, monthStart, monthEnd);
   });
 
-  libraryItems.forEach(item => {
-    if (!isDeployed(item)) return;
-    const type = item.type;
-    if (!DAILY_TARGETS[type]) return;
-    if (item.deployedAt >= todayStart && item.deployedAt < todayEnd) {
-      deployedTodayByType[type]++;
-    }
-    if (item.deployedAt >= monthStart && item.deployedAt < monthEnd) {
-      deployedMonthByType[type]++;
-      const day = new Date(item.deployedAt).getDate();
-      deployedByDay[day] = (deployedByDay[day] || 0) + 1;
-    }
+  // Build per-day map for heatmap
+  myEvents.forEach(e => {
+    if (e.action !== 'library.push_wp') return;
+    if (e.timestamp < monthStart || e.timestamp >= monthEnd) return;
+    const day = new Date(e.timestamp).getDate();
+    deployedByDay[day] = (deployedByDay[day] || 0) + 1;
   });
 
-  // Day complete = all categories hit their daily target
-  const dayComplete = Object.entries(DAILY_TARGETS).every(([type, t]) => deployedTodayByType[type] >= t.daily);
-  const totalDeployedToday = Object.values(deployedTodayByType).reduce((s, n) => s + n, 0);
-  const totalDailyTarget = Object.values(DAILY_TARGETS).reduce((s, t) => s + t.daily, 0);
+  // Filter out types with 0 target (so user only sees what's expected of them)
+  const activeTargets = Object.entries(PERSONAL_TARGETS).filter(([, n]) => n > 0);
+  const targetTypes = activeTargets.map(([k]) => k);
 
-  // Pending work counts — anything not yet deployed
+  const dayComplete = activeTargets.length > 0 && activeTargets.every(([type, n]) => deployedTodayByType[type] >= n);
+  const totalDeployedToday = targetTypes.reduce((s, t) => s + deployedTodayByType[t], 0);
+  const totalDailyTarget = activeTargets.reduce((s, [, n]) => s + n, 0);
+
+  // Pending work counts (team-wide is fine since it's collaborative)
   const draftCount = drafts.length;
   const pendingTopicsCount = topics.filter(t => t.status === 'pending').length;
   const readyCount = libraryItems.filter(i => !i.deployed).length;
@@ -3976,114 +4067,125 @@ function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
     <>
       <div style={styles.dashTopRow}>
         <div>
-          <div style={styles.dashEyebrow}>Today</div>
+          <div style={styles.dashEyebrow}>Today · Your workload</div>
           <h1 style={styles.dashHeadline}>{dayName}, {dateStr}</h1>
           {currentUser && <div style={styles.dashGreeting}>Hi {currentUser.name?.split(' ')[0] || currentUser.username} 👋</div>}
         </div>
-        {dayComplete ? (
+        {activeTargets.length === 0 ? (
+          <div style={styles.dayProgressBadge}>
+            <div style={styles.dayProgressLabel} title="Ask an admin to set your daily targets">no targets set</div>
+          </div>
+        ) : dayComplete ? (
           <div style={styles.dayCompleteBadge}>
             <div style={styles.dayCompleteTick}><Check size={20} strokeWidth={3} /></div>
             <div>
               <div style={styles.dayCompleteTitle}>Day complete</div>
-              <div style={styles.dayCompleteSub}>All daily targets met</div>
+              <div style={styles.dayCompleteSub}>All your targets met</div>
             </div>
           </div>
         ) : (
           <div style={styles.dayProgressBadge}>
             <div style={styles.dayProgressNum}>{totalDeployedToday}<span style={styles.dayProgressOf}>/{totalDailyTarget}</span></div>
-            <div style={styles.dayProgressLabel}>deployed today</div>
+            <div style={styles.dayProgressLabel}>your pieces today</div>
           </div>
         )}
       </div>
 
-      {/* Daily target cards */}
-      <div style={styles.dashCards}>
-        {Object.entries(DAILY_TARGETS).map(([type, t]) => {
-          const todayCount = deployedTodayByType[type];
-          const outstanding = Math.max(0, t.daily - todayCount);
-          const isComplete = todayCount >= t.daily;
-          const monthCount = deployedMonthByType[type];
-          const monthTarget = t.daily * daysInMonth;
-          const monthExpected = t.daily * dayOfMonth;
-          const monthPct = Math.min(100, Math.round((monthCount / monthTarget) * 100));
-          const onPace = monthCount >= monthExpected;
-          const Icon = t.icon;
+      {/* Personal target cards */}
+      {activeTargets.length > 0 ? (
+        <div style={styles.dashCards}>
+          {activeTargets.map(([type, dailyN]) => {
+            const t = DAILY_TARGETS[type];
+            const todayCount = deployedTodayByType[type];
+            const outstanding = Math.max(0, dailyN - todayCount);
+            const isComplete = todayCount >= dailyN;
+            const monthCount = deployedMonthByType[type];
+            const monthTarget = dailyN * daysInMonth;
+            const monthExpected = dailyN * dayOfMonth;
+            const monthPct = monthTarget > 0 ? Math.min(100, Math.round((monthCount / monthTarget) * 100)) : 0;
+            const onPace = monthCount >= monthExpected;
+            const Icon = t.icon;
 
-          return (
-            <div key={type} style={{ ...styles.dashCard, ...(isComplete ? styles.dashCardComplete : {}) }}>
-              <div style={styles.dashCardHeader}>
-                <div style={{ ...styles.dashCardIcon, color: t.color, background: t.bg }}>
-                  <Icon size={18} strokeWidth={2} />
-                </div>
-                <div style={styles.dashCardLabel}>{t.label}</div>
-                {isComplete && (
-                  <div style={styles.dashCardTick} title="Daily target met">
-                    <Check size={14} strokeWidth={3} />
+            return (
+              <div key={type} style={{ ...styles.dashCard, ...(isComplete ? styles.dashCardComplete : {}) }}>
+                <div style={styles.dashCardHeader}>
+                  <div style={{ ...styles.dashCardIcon, color: t.color, background: t.bg }}>
+                    <Icon size={18} strokeWidth={2} />
                   </div>
-                )}
-              </div>
-
-              <div style={styles.dashCardMainRow}>
-                <div style={styles.dashCardBigNum}>
-                  {todayCount}<span style={styles.dashCardSlash}>/{t.daily}</span>
+                  <div style={styles.dashCardLabel}>{t.label}</div>
+                  {isComplete && (
+                    <div style={styles.dashCardTick} title="Daily target met">
+                      <Check size={14} strokeWidth={3} />
+                    </div>
+                  )}
                 </div>
-                <div style={styles.dashCardStatus}>
-                  {isComplete
-                    ? <span style={styles.dashCardOk}>complete</span>
-                    : <span style={styles.dashCardOutstanding}>{outstanding} outstanding</span>}
-                </div>
-              </div>
 
-              <div style={styles.dashProgressTrack}>
-                <div style={{
-                  ...styles.dashProgressFill,
-                  width: `${Math.min(100, (todayCount / t.daily) * 100)}%`,
-                  background: isComplete ? 'var(--c-green)' : t.color,
-                }} />
-              </div>
-
-              <div style={styles.dashCardMonthly}>
-                <div style={styles.dashCardMonthlyRow}>
-                  <span style={styles.dashCardMonthlyLabel}>This month</span>
-                  <span style={styles.dashCardMonthlyVal}>{monthCount} / {monthTarget}</span>
+                <div style={styles.dashCardMainRow}>
+                  <div style={styles.dashCardBigNum}>
+                    {todayCount}<span style={styles.dashCardSlash}>/{dailyN}</span>
+                  </div>
+                  <div style={styles.dashCardStatus}>
+                    {isComplete
+                      ? <span style={styles.dashCardOk}>complete</span>
+                      : <span style={styles.dashCardOutstanding}>{outstanding} outstanding</span>}
+                  </div>
                 </div>
-                <div style={styles.dashMonthlyTrack}>
-                  <div style={{ ...styles.dashMonthlyFill, width: `${monthPct}%`, background: t.color }} />
-                  {/* Expected-by-now marker */}
+
+                <div style={styles.dashProgressTrack}>
                   <div style={{
-                    ...styles.dashMonthlyMarker,
-                    left: `${Math.min(100, (monthExpected / monthTarget) * 100)}%`,
-                  }} title={`Expected by day ${dayOfMonth}: ${monthExpected}`} />
+                    ...styles.dashProgressFill,
+                    width: `${Math.min(100, (todayCount / dailyN) * 100)}%`,
+                    background: isComplete ? 'var(--c-green)' : t.color,
+                  }} />
                 </div>
-                <div style={{ ...styles.dashCardPace, color: onPace ? 'var(--c-green)' : 'var(--c-ochre)' }}>
-                  {onPace ? `on pace` : `${monthExpected - monthCount} behind pace`}
+
+                <div style={styles.dashCardMonthly}>
+                  <div style={styles.dashCardMonthlyRow}>
+                    <span style={styles.dashCardMonthlyLabel}>This month</span>
+                    <span style={styles.dashCardMonthlyVal}>{monthCount} / {monthTarget}</span>
+                  </div>
+                  <div style={styles.dashMonthlyTrack}>
+                    <div style={{ ...styles.dashMonthlyFill, width: `${monthPct}%`, background: t.color }} />
+                    <div style={{
+                      ...styles.dashMonthlyMarker,
+                      left: `${Math.min(100, (monthExpected / monthTarget) * 100)}%`,
+                    }} title={`Expected by day ${dayOfMonth}: ${monthExpected}`} />
+                  </div>
+                  <div style={{ ...styles.dashCardPace, color: onPace ? 'var(--c-green)' : 'var(--c-ochre)' }}>
+                    {onPace ? `on pace` : `${monthExpected - monthCount} behind pace`}
+                  </div>
                 </div>
               </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div style={{ ...styles.wpBanner, ...styles.wpBannerWarn }}>
+          <AlertCircle size={13} />
+          No daily targets set for you yet. Ask an admin to assign your workload in the Users tab.
+        </div>
+      )}
 
-      {/* Quick links — what's outstanding */}
+      {/* Quick links — what's outstanding (team-wide) */}
       <div style={styles.dashStatsStrip}>
         <DashStat label="Pending topics" value={pendingTopicsCount} onClick={() => setView('evergreen')} />
         <DashStat label="Drafts to review" value={draftCount} onClick={() => setView('evergreen')} />
         <DashStat label="Ready to publish" value={readyCount} onClick={() => setView('library')} />
-        <DashStat label="Total deployed" value={libraryItems.filter(i => i.deployed).length} />
+        <DashStat label="My deployed total" value={myEvents.filter(e => e.action === 'library.push_wp').length} />
       </div>
 
-      {/* Monthly heatmap */}
+      {/* Monthly heatmap — personal */}
       <section style={styles.dashSection}>
         <div style={styles.dashSectionHead}>
           <Calendar size={16} style={{ color: 'var(--c-muted)' }} />
           <h2 style={styles.dashSectionTitle}>{monthName}</h2>
-          <span style={styles.dashSectionSub}>· deployments per day</span>
+          <span style={styles.dashSectionSub}>· your deployments per day</span>
         </div>
         <MonthHeatmap
           daysInMonth={daysInMonth}
           dayOfMonth={dayOfMonth}
           deployedByDay={deployedByDay}
-          dailyTotalTarget={totalDailyTarget}
+          dailyTotalTarget={totalDailyTarget || 1}
           firstDayOfMonth={new Date(now.getFullYear(), now.getMonth(), 1).getDay()}
         />
       </section>
@@ -5151,6 +5253,11 @@ const styles = {
   bulkPreviewUrl: { fontSize: 11.5, color: colors.muted, fontFamily: 'ui-monospace, monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 },
   bulkPreviewMeta: { fontSize: 11, color: colors.faint, fontStyle: 'italic' },
   bulkPreviewMore: { fontSize: 11, color: colors.muted, fontStyle: 'italic', paddingTop: 4 },
+
+  // Targets editor in users table
+  targetsEditor: { display: 'flex', alignItems: 'center', gap: 4 },
+  targetInput: { width: 38, padding: '5px 4px', fontSize: 12.5, textAlign: 'center', border: `1px solid ${colors.border}`, borderRadius: 4, background: colors.inputBg, fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600 },
+  targetSaveBtn: { background: colors.green, color: '#FFFFFF', border: 'none', borderRadius: 4, padding: '5px 7px', display: 'flex', alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
 
   // === CATEGORY ACCORDION (topics + drafts) ===
   accordionToolbar: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, fontSize: 11.5, color: colors.muted },
