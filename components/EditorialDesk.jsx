@@ -787,13 +787,54 @@ export default function EditorialDesk() {
   };
 
   // ---- write article from topic (background) ----
-  const writeArticle = async (topic) => {
-    updateTopic(topic.id, { status: 'writing' });
+  // ---- write queue (concurrency-limited article generation) ----
+  const MAX_CONCURRENT_WRITES = 2;
+  const STUCK_THRESHOLD_MS = 3 * 60 * 1000; // 3 min — typical generation is 30–90s
+
+  const writeQueueRef = useRef([]);
+  const inFlightRef = useRef(new Set());
+  const [queueState, setQueueState] = useState({ waiting: 0, inFlight: 0 });
+
+  const updateQueueState = () => {
+    setQueueState({
+      waiting: writeQueueRef.current.length,
+      inFlight: inFlightRef.current.size,
+    });
+  };
+
+  const writeArticle = (topic) => {
+    // Skip if already queued or in flight
+    if (writeQueueRef.current.find(t => t.id === topic.id)) return;
+    if (inFlightRef.current.has(topic.id)) return;
+    updateTopic(topic.id, { status: 'queued', error: null });
+    writeQueueRef.current.push(topic);
+    updateQueueState();
+    processWriteQueue();
+  };
+
+  const processWriteQueue = () => {
+    while (inFlightRef.current.size < MAX_CONCURRENT_WRITES && writeQueueRef.current.length > 0) {
+      const topic = writeQueueRef.current.shift();
+      inFlightRef.current.add(topic.id);
+      updateQueueState();
+      executeWrite(topic).finally(() => {
+        inFlightRef.current.delete(topic.id);
+        updateQueueState();
+        processWriteQueue();
+      });
+    }
+  };
+
+  const executeWrite = async (topic) => {
+    updateTopic(topic.id, { status: 'writing', writingStartedAt: Date.now(), error: null });
     try {
       const linkingContext = buildLinkingContext();
       const catTraining = categoryTraining[topic.category] || '';
       const prompt = buildArticlePrompt(topic, settings.instructions, settings.style, linkingContext, catTraining);
       const text = await callClaude(prompt, true, 6000);
+      if (!text || text.length < 200) {
+        throw new Error(`Empty or too-short response (${text?.length || 0} chars). Possible rate limit or stream interruption.`);
+      }
       const parsed = parseArticleOutput(text);
       const draft = {
         id: uid(),
@@ -811,13 +852,48 @@ export default function EditorialDesk() {
         createdAt: Date.now()
       };
       addDraft(draft);
-      updateTopic(topic.id, { status: 'written', draftId: draft.id });
+      updateTopic(topic.id, { status: 'written', draftId: draft.id, writingStartedAt: null, error: null });
       logAction('draft.write', { draftId: draft.id, topicId: topic.id, type: topic.type, title: draft.title });
     } catch (e) {
-      updateTopic(topic.id, { status: 'pending', error: e.message });
-      showToast(`Write failed: ${e.message.slice(0, 80)}`, 'error');
+      const errMsg = e.message || 'Unknown error';
+      updateTopic(topic.id, { status: 'failed', writingStartedAt: null, error: errMsg, failedAt: Date.now() });
+      logAction('draft.write_failed', { topicId: topic.id, title: topic.title, error: errMsg.slice(0, 200) });
+      showToast(`Write failed: "${topic.title.slice(0, 40)}…" — ${errMsg.slice(0, 80)}`, 'error');
     }
   };
+
+  const retryFailedTopic = (topic) => {
+    writeArticle(topic);
+  };
+
+  const retryAllStuck = () => {
+    const stuck = topics.filter(t => t.status === 'failed' || (t.status === 'writing' && !inFlightRef.current.has(t.id)));
+    stuck.forEach(t => writeArticle(t));
+    showToast(`Retrying ${stuck.length} ${stuck.length === 1 ? 'topic' : 'topics'}`, 'success');
+  };
+
+  // ---- detect topics stuck in 'writing' from a previous session ----
+  useEffect(() => {
+    if (!loaded || !authStatus.user) return;
+    const stuck = topics.filter(t =>
+      t.status === 'writing' &&
+      !inFlightRef.current.has(t.id) &&
+      (!t.writingStartedAt || Date.now() - t.writingStartedAt > STUCK_THRESHOLD_MS)
+    );
+    if (stuck.length > 0) {
+      setTopics(prev => {
+        const next = prev.map(t => stuck.find(s => s.id === t.id) ? {
+          ...t,
+          status: 'failed',
+          error: 'Generation interrupted — likely browser was closed or refreshed before it finished',
+          failedAt: Date.now(),
+        } : t);
+        storage.set('topics', next);
+        return next;
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
 
   // ---- run a saved prompt ----
   const runPrompt = async (filledPrompt) => {
@@ -1208,6 +1284,9 @@ Return ONLY a JSON array (no preamble, no fences):
             drafts={drafts.filter(d => d.type === view)}
             onGenerate={(count) => generateTopics(view, seeds[view], count)}
             onApproveWrite={writeArticle}
+            onRetryFailed={retryFailedTopic}
+            onRetryAllStuck={retryAllStuck}
+            queueState={queueState}
             onRejectTopic={(id) => updateTopic(id, { status: 'rejected' })}
             onReinstateTopic={(id) => updateTopic(id, { status: 'pending' })}
             onDeleteTopic={deleteTopic}
@@ -1682,7 +1761,8 @@ function TopBar({ onMenuClick, currentView }) {
 
 function PipelineView({
   type, seed, onSeedChange, topics, drafts,
-  onGenerate, onApproveWrite, onRejectTopic, onReinstateTopic, onDeleteTopic,
+  onGenerate, onApproveWrite, onRetryFailed, onRetryAllStuck, queueState,
+  onRejectTopic, onReinstateTopic, onDeleteTopic,
   onOpenDraft, onPublishDraft, onRejectDraft, onDeleteDraft, canApprove
 }) {
   const [count, setCount] = useState(50);
@@ -1726,8 +1806,10 @@ function PipelineView({
 
   const topicCounts = {
     pending: topics.filter(t => t.status === 'pending').length,
+    queued: topics.filter(t => t.status === 'queued').length,
     writing: topics.filter(t => t.status === 'writing').length,
     written: topics.filter(t => t.status === 'written').length,
+    failed: topics.filter(t => t.status === 'failed').length,
     rejected: topics.filter(t => t.status === 'rejected').length,
   };
 
@@ -1797,18 +1879,33 @@ function PipelineView({
       {/* TOPICS TAB */}
       {tab === 'topics' && (
         <>
+          {/* Queue / failure banner */}
+          {(queueState.waiting > 0 || queueState.inFlight > 0 || topicCounts.failed > 0) && (
+            <WriteQueueBanner
+              queueState={queueState}
+              failedCount={topicCounts.failed}
+              onRetryAll={onRetryAllStuck}
+            />
+          )}
+
           <div style={styles.filterRow}>
             {[
               { id: 'pending', label: 'To approve', count: topicCounts.pending },
+              { id: 'queued', label: 'Queued', count: topicCounts.queued },
               { id: 'writing', label: 'Writing', count: topicCounts.writing },
+              { id: 'failed', label: 'Failed', count: topicCounts.failed, attention: topicCounts.failed > 0 },
               { id: 'written', label: 'Written', count: topicCounts.written },
               { id: 'rejected', label: 'Rejected', count: topicCounts.rejected },
               { id: 'all', label: 'All', count: topics.length },
-            ].map(f => (
+            ].filter(f => f.id === 'all' || f.id === 'pending' || f.count > 0).map(f => (
               <button
                 key={f.id}
                 onClick={() => setFilter(f.id)}
-                style={{ ...styles.filterBtn, ...(filter === f.id ? styles.filterBtnActive : {}) }}
+                style={{
+                  ...styles.filterBtn,
+                  ...(filter === f.id ? styles.filterBtnActive : {}),
+                  ...(f.attention && filter !== f.id ? styles.filterBtnAttention : {})
+                }}
               >
                 {f.label} <span style={styles.filterCount}>{f.count}</span>
               </button>
@@ -1832,6 +1929,7 @@ function PipelineView({
                   key={t.id}
                   topic={t}
                   onApproveWrite={() => onApproveWrite(t)}
+                  onRetryFailed={onRetryFailed}
                   onReject={() => onRejectTopic(t.id)}
                   onReinstate={() => onReinstateTopic(t.id)}
                   onDelete={() => onDeleteTopic(t.id)}
@@ -1983,24 +2081,71 @@ function CategoryAccordion({ items, renderRow, storageKey }) {
 // TOPIC ROW (compact, expandable)
 // ============================================================================
 
-function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete, canApprove = true }) {
+// ============================================================================
+// WRITE QUEUE BANNER — shows in-flight + queued counts, retry-all button
+// ============================================================================
+
+function WriteQueueBanner({ queueState, failedCount, onRetryAll }) {
+  const { waiting, inFlight } = queueState;
+  const active = inFlight > 0 || waiting > 0;
+  return (
+    <div style={{ ...styles.queueBanner, ...(failedCount > 0 ? styles.queueBannerWarn : {}) }}>
+      <div style={styles.queueBannerLeft}>
+        {active && (
+          <span style={styles.queueBannerSpinner}>
+            <Loader2 size={14} className="claude-spin" />
+          </span>
+        )}
+        <div>
+          {active && (
+            <div style={styles.queueBannerTitle}>
+              Writing in progress · {inFlight} active{waiting > 0 ? `, ${waiting} queued` : ''}
+            </div>
+          )}
+          {!active && failedCount > 0 && (
+            <div style={styles.queueBannerTitle}>
+              {failedCount} {failedCount === 1 ? 'topic failed' : 'topics failed'} to write
+            </div>
+          )}
+          <div style={styles.queueBannerSub}>
+            {active && 'Articles generate 2 at a time. Keep this tab open until they finish.'}
+            {!active && failedCount > 0 && 'Tap retry to try them again — common causes are rate limits or the tab being closed mid-write.'}
+          </div>
+        </div>
+      </div>
+      {failedCount > 0 && (
+        <button style={styles.queueBannerBtn} onClick={onRetryAll}>
+          <RefreshCw size={13} /> Retry {failedCount} failed
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// TOPIC ROW (compact, expandable)
+// ============================================================================
+
+function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate, onDelete, canApprove = true }) {
   const [expanded, setExpanded] = useState(false);
 
   const statusColor = {
     pending: '#C77D4A',
+    queued: '#7C7466',
     writing: '#3A5266',
     written: '#2D5F4E',
+    failed: '#A14438',
     rejected: '#9A9486'
   }[topic.status];
 
-  const categoryLabel = {
-    fitness: 'Fitness', nutrition: 'Nutrition', mental_health: 'Mental health',
-    health_guides: 'Health guides', beauty: 'Beauty',
-    // legacy
-    wellness: 'Health guides', mens: 'Health guides', womens: 'Health guides'
-  }[topic.category] || topic.category;
+  const categoryLabel = CATEGORY_LABELS[topic.category] || topic.category;
 
   const isWriting = topic.status === 'writing';
+
+  // Time elapsed while writing
+  const writingElapsed = isWriting && topic.writingStartedAt
+    ? Math.floor((Date.now() - topic.writingStartedAt) / 1000)
+    : 0;
 
   return (
     <article style={{ ...styles.topicRow, ...(expanded ? styles.topicRowExpanded : {}) }}>
@@ -2013,11 +2158,14 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete, canA
           <div style={styles.topicRowTitle}>{topic.title}</div>
           <div style={styles.topicRowMeta}>
             <span style={styles.cardCategory}>{categoryLabel}</span>
-            <span style={styles.cardDot}>·</span>
-            <span style={styles.cardEffort}>{topic.effort}</span>
-            <span style={styles.cardDot}>·</span>
-            <span style={styles.kwTag}>{topic.keyword}</span>
+            {topic.effort && <><span style={styles.cardDot}>·</span><span style={styles.cardEffort}>{topic.effort}</span></>}
+            {topic.keyword && <><span style={styles.cardDot}>·</span><span style={styles.kwTag}>{topic.keyword}</span></>}
           </div>
+          {topic.status === 'failed' && topic.error && (
+            <div style={styles.topicErrorMsg}>
+              <AlertCircle size={11} /> {topic.error}
+            </div>
+          )}
         </div>
         <div style={styles.topicRowActions}>
           {topic.status === 'pending' && canApprove && (
@@ -2035,16 +2183,30 @@ function TopicRow({ topic, onApproveWrite, onReject, onReinstate, onDelete, canA
               <Eye size={11} /> awaiting review
             </span>
           )}
+          {topic.status === 'queued' && (
+            <span style={styles.queuedChip} title="Waiting for an open slot">
+              <Loader2 size={11} /> queued
+            </span>
+          )}
           {isWriting && (
-            <div style={styles.writingChip}>
+            <div style={styles.writingChip} title={`Writing for ${writingElapsed}s`}>
               <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
-              writing
+              writing {writingElapsed > 0 && <span style={styles.writingElapsed}>{writingElapsed}s</span>}
             </div>
           )}
           {topic.status === 'written' && (
             <span style={styles.doneChip}>
               <Check size={11} /> drafted
             </span>
+          )}
+          {topic.status === 'failed' && canApprove && (
+            <button
+              style={{ ...styles.iconActionBtn, ...styles.iconActionRetry }}
+              onClick={() => onRetryFailed && onRetryFailed(topic)}
+              title={`Retry — ${topic.error || 'no error message'}`}
+            >
+              <RefreshCw size={13} /> retry
+            </button>
           )}
           {topic.status === 'rejected' && (
             <button style={styles.iconActionBtn} onClick={onReinstate} title="Reinstate">
@@ -4007,9 +4169,9 @@ function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
   // Personal daily targets (fall back to global defaults)
   const PERSONAL_TARGETS = currentUser?.dailyTargets || { evergreen: 2, news: 4, mythbusting: 2 };
 
-  // Helper: deploy events for this user in a time range, by type
+  // Helper: publish events for this user in a time range, by type
   const countEvents = (type, startMs, endMs) => myEvents.filter(e =>
-    e.action === 'library.push_wp' &&
+    e.action === 'draft.approve' &&
     e.timestamp >= startMs && e.timestamp < endMs &&
     e.metadata?.type === type
   ).length;
@@ -4024,9 +4186,9 @@ function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
     deployedMonthByType[type] = countEvents(type, monthStart, monthEnd);
   });
 
-  // Build per-day map for heatmap
+  // Build per-day map for heatmap (counts published pieces)
   myEvents.forEach(e => {
-    if (e.action !== 'library.push_wp') return;
+    if (e.action !== 'draft.approve') return;
     if (e.timestamp < monthStart || e.timestamp >= monthEnd) return;
     const day = new Date(e.timestamp).getDate();
     deployedByDay[day] = (deployedByDay[day] || 0) + 1;
@@ -4153,7 +4315,7 @@ function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
         <DashStat label="Pending topics" value={pendingTopicsCount} onClick={() => setView('evergreen')} />
         <DashStat label="Drafts to review" value={draftCount} onClick={() => setView('evergreen')} />
         <DashStat label="Ready to publish" value={readyCount} onClick={() => setView('library')} />
-        <DashStat label="My deployed total" value={myEvents.filter(e => e.action === 'library.push_wp').length} />
+        <DashStat label="My published total" value={myEvents.filter(e => e.action === 'draft.approve').length} />
       </div>
 
       {/* Monthly heatmap — personal */}
@@ -4161,7 +4323,7 @@ function DashboardView({ libraryItems, drafts, topics, currentUser, setView }) {
         <div style={styles.dashSectionHead}>
           <Calendar size={16} style={{ color: 'var(--c-muted)' }} />
           <h2 style={styles.dashSectionTitle}>{monthName}</h2>
-          <span style={styles.dashSectionSub}>· your deployments per day</span>
+          <span style={styles.dashSectionSub}>· your published pieces per day</span>
         </div>
         <MonthHeatmap
           daysInMonth={daysInMonth}
@@ -5241,6 +5403,50 @@ const styles = {
   targetGroup: { display: 'inline-flex', alignItems: 'center', gap: 4, background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '2px 2px 2px 4px' },
   targetTypeBadge: { fontSize: 9.5, fontWeight: 700, padding: '2px 5px', borderRadius: 3, letterSpacing: '0.05em', lineHeight: 1 },
   targetSelect: { padding: '3px 4px 3px 6px', fontSize: 12.5, border: 'none', background: 'transparent', fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600, cursor: 'pointer', outline: 'none' },
+
+  // === WRITE QUEUE / RETRY ===
+  queueBanner: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16,
+    padding: '12px 16px', marginBottom: 14,
+    background: colors.surface, border: `1px solid ${colors.border}`, borderLeft: `3px solid ${colors.green}`,
+    borderRadius: 6,
+  },
+  queueBannerWarn: { borderLeftColor: '#A14438' },
+  queueBannerLeft: { display: 'flex', alignItems: 'flex-start', gap: 12, flex: 1, minWidth: 0 },
+  queueBannerSpinner: { color: colors.green, display: 'flex', alignItems: 'center', paddingTop: 2 },
+  queueBannerTitle: { fontSize: 13, fontWeight: 600, color: colors.ink, marginBottom: 2 },
+  queueBannerSub: { fontSize: 11.5, color: colors.muted, lineHeight: 1.4 },
+  queueBannerBtn: {
+    display: 'inline-flex', alignItems: 'center', gap: 6,
+    padding: '7px 12px', fontSize: 12, fontWeight: 600,
+    background: '#A14438', color: '#FFFFFF', border: 'none', borderRadius: 5,
+    fontFamily: fonts.body, whiteSpace: 'nowrap',
+  },
+
+  filterBtnAttention: {
+    borderColor: '#A14438',
+    background: 'rgba(161, 68, 56, 0.08)',
+    color: '#A14438',
+  },
+
+  queuedChip: {
+    display: 'inline-flex', alignItems: 'center', gap: 5,
+    fontSize: 11, color: colors.muted, fontWeight: 500,
+    padding: '3px 8px', background: colors.bg, border: `1px solid ${colors.borderSoft}`, borderRadius: 4,
+  },
+  writingElapsed: { opacity: 0.7, fontWeight: 400, marginLeft: 4 },
+
+  iconActionRetry: {
+    display: 'inline-flex', alignItems: 'center', gap: 5,
+    padding: '5px 9px', fontSize: 11.5, fontWeight: 600,
+    background: 'rgba(161, 68, 56, 0.08)', color: '#A14438',
+    borderColor: 'rgba(161, 68, 56, 0.3)',
+  },
+
+  topicErrorMsg: {
+    display: 'flex', alignItems: 'flex-start', gap: 5,
+    fontSize: 11, color: '#A14438', marginTop: 4, lineHeight: 1.4,
+  },
 
   // === CATEGORY ACCORDION (topics + drafts) ===
   accordionToolbar: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, fontSize: 11.5, color: colors.muted },
