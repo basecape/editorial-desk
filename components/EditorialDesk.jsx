@@ -786,80 +786,23 @@ export default function EditorialDesk() {
     }
   };
 
-  // ---- write article from topic (background) ----
-  // ---- write queue (concurrency-limited article generation) ----
-  const MAX_CONCURRENT_WRITES = 2;
-  const STUCK_THRESHOLD_MS = 3 * 60 * 1000; // 3 min — typical generation is 30–90s
+  // ---- server-side write queue ----
+  // Topics with status='queued' are picked up by /api/queue/process (runs every
+  // minute via Vercel Cron). The browser can close, phone can lock, this keeps
+  // running server-side. Client just enqueues + polls for updates.
+  const STUCK_THRESHOLD_MS = 6 * 60 * 1000; // 6 min — server has 5 min timeout
 
-  const writeQueueRef = useRef([]);
-  const inFlightRef = useRef(new Set());
   const [queueState, setQueueState] = useState({ waiting: 0, inFlight: 0 });
 
-  const updateQueueState = () => {
-    setQueueState({
-      waiting: writeQueueRef.current.length,
-      inFlight: inFlightRef.current.size,
-    });
-  };
-
-  const writeArticle = (topic) => {
-    // Skip if already queued or in flight
-    if (writeQueueRef.current.find(t => t.id === topic.id)) return;
-    if (inFlightRef.current.has(topic.id)) return;
-    updateTopic(topic.id, { status: 'queued', error: null });
-    writeQueueRef.current.push(topic);
-    updateQueueState();
-    processWriteQueue();
-  };
-
-  const processWriteQueue = () => {
-    while (inFlightRef.current.size < MAX_CONCURRENT_WRITES && writeQueueRef.current.length > 0) {
-      const topic = writeQueueRef.current.shift();
-      inFlightRef.current.add(topic.id);
-      updateQueueState();
-      executeWrite(topic).finally(() => {
-        inFlightRef.current.delete(topic.id);
-        updateQueueState();
-        processWriteQueue();
-      });
-    }
-  };
-
-  const executeWrite = async (topic) => {
-    updateTopic(topic.id, { status: 'writing', writingStartedAt: Date.now(), error: null });
+  const writeArticle = async (topic) => {
+    // Just mark as queued in KV. The server worker will pick it up.
+    updateTopic(topic.id, { status: 'queued', error: null, queuedAt: Date.now() });
+    showToast(`Queued "${topic.title.slice(0, 40)}…" — writing server-side`, 'success');
+    // Optional: nudge the worker to run immediately instead of waiting for cron
     try {
-      const linkingContext = buildLinkingContext();
-      const catTraining = categoryTraining[topic.category] || '';
-      const prompt = buildArticlePrompt(topic, settings.instructions, settings.style, linkingContext, catTraining);
-      const text = await callClaude(prompt, true, 6000);
-      if (!text || text.length < 200) {
-        throw new Error(`Empty or too-short response (${text?.length || 0} chars). Possible rate limit or stream interruption.`);
-      }
-      const parsed = parseArticleOutput(text);
-      const draft = {
-        id: uid(),
-        topicId: topic.id,
-        type: topic.type,
-        title: parsed.title || topic.title,
-        meta: parsed.meta || '',
-        excerpt: parsed.excerpt || '',
-        tags: parsed.tags || [],
-        category: parsed.category || topic.category || '',
-        cluster: topic.cluster || '',
-        imageQuery: parsed.imageQuery || '',
-        content: parsed.content || text,
-        status: 'pending',
-        createdAt: Date.now()
-      };
-      addDraft(draft);
-      updateTopic(topic.id, { status: 'written', draftId: draft.id, writingStartedAt: null, error: null });
-      logAction('draft.write', { draftId: draft.id, topicId: topic.id, type: topic.type, title: draft.title });
-    } catch (e) {
-      const errMsg = e.message || 'Unknown error';
-      updateTopic(topic.id, { status: 'failed', writingStartedAt: null, error: errMsg, failedAt: Date.now() });
-      logAction('draft.write_failed', { topicId: topic.id, title: topic.title, error: errMsg.slice(0, 200) });
-      showToast(`Write failed: "${topic.title.slice(0, 40)}…" — ${errMsg.slice(0, 80)}`, 'error');
-    }
+      fetch('/api/queue/process', { method: 'POST', credentials: 'same-origin' })
+        .catch(() => {}); // fire and forget; cron will still catch it
+    } catch {}
   };
 
   const retryFailedTopic = (topic) => {
@@ -867,25 +810,74 @@ export default function EditorialDesk() {
   };
 
   const retryAllStuck = () => {
-    const stuck = topics.filter(t => t.status === 'failed' || (t.status === 'writing' && !inFlightRef.current.has(t.id)));
-    stuck.forEach(t => writeArticle(t));
-    showToast(`Retrying ${stuck.length} ${stuck.length === 1 ? 'topic' : 'topics'}`, 'success');
+    const stuck = topics.filter(t => t.status === 'failed' ||
+      (t.status === 'writing' && (!t.writingStartedAt || Date.now() - t.writingStartedAt > STUCK_THRESHOLD_MS)));
+    if (stuck.length === 0) {
+      showToast('No stuck topics to retry', 'success');
+      return;
+    }
+    // Batch-update to queued and single toast
+    setTopics(prev => {
+      const now = Date.now();
+      const next = prev.map(t => stuck.find(s => s.id === t.id)
+        ? { ...t, status: 'queued', error: null, queuedAt: now }
+        : t);
+      storage.set('topics', next);
+      return next;
+    });
+    showToast(`Requeued ${stuck.length} ${stuck.length === 1 ? 'topic' : 'topics'} — worker will process them`, 'success');
+    try {
+      fetch('/api/queue/process', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+    } catch {}
   };
 
-  // ---- detect topics stuck in 'writing' from a previous session ----
+  // ---- poll topics every 15s while there are queued/writing items ----
+  useEffect(() => {
+    if (!loaded || !authStatus.user) return;
+    const activeInQueue = topics.filter(t => t.status === 'queued' || t.status === 'writing').length;
+
+    // Update queue state indicator
+    setQueueState({
+      waiting: topics.filter(t => t.status === 'queued').length,
+      inFlight: topics.filter(t => t.status === 'writing').length,
+    });
+
+    if (activeInQueue === 0) return; // nothing to poll for
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/data/topics', { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const data = await res.json();
+        const fresh = data.value || [];
+        setTopics(fresh);
+        // Also refresh drafts in case new ones landed
+        const draftsRes = await fetch('/api/data/drafts', { credentials: 'same-origin' });
+        if (draftsRes.ok) {
+          const draftsData = await draftsRes.json();
+          setDrafts(draftsData.value || []);
+        }
+      } catch {}
+    }, 15000); // 15 seconds
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, authStatus.user, topics.map(t => t.status).join('|')]);
+
+  // ---- detect topics stuck in 'writing' beyond server timeout ----
   useEffect(() => {
     if (!loaded || !authStatus.user) return;
     const stuck = topics.filter(t =>
       t.status === 'writing' &&
-      !inFlightRef.current.has(t.id) &&
-      (!t.writingStartedAt || Date.now() - t.writingStartedAt > STUCK_THRESHOLD_MS)
+      t.writingStartedAt &&
+      Date.now() - t.writingStartedAt > STUCK_THRESHOLD_MS
     );
     if (stuck.length > 0) {
       setTopics(prev => {
         const next = prev.map(t => stuck.find(s => s.id === t.id) ? {
           ...t,
           status: 'failed',
-          error: 'Generation interrupted — likely browser was closed or refreshed before it finished',
+          error: 'Server worker did not complete this write — probably hit function timeout. Retry.',
           failedAt: Date.now(),
         } : t);
         storage.set('topics', next);
@@ -1272,6 +1264,24 @@ Return ONLY a JSON array (no preamble, no fences):
                 });
               }
             }}
+            onUpdateCategory={(item, kind, category) => {
+              if (kind === 'topic') updateTopic(item.id, { category });
+              else if (kind === 'draft') updateDraft(item.id, { category });
+              else if (kind === 'library') {
+                setLibraryItems(prev => {
+                  const next = prev.map(l => l.id === item.id ? { ...l, category } : l);
+                  storage.set('library', next);
+                  return next;
+                });
+              } else if (kind === 'sitePage') {
+                setSitePages(prev => {
+                  const next = prev.map(p => p.id === item.id ? { ...p, category } : p);
+                  storage.set('sitePages', next);
+                  return next;
+                });
+              }
+              showToast(`Moved "${item.title.slice(0, 30)}…" to ${CATEGORY_LABELS[category] || category}`, 'success');
+            }}
           />
         )}
 
@@ -1353,6 +1363,10 @@ Return ONLY a JSON array (no preamble, no fences):
         {view === 'reports' && isAdmin && (
           <ReportsView showToast={showToast} />
         )}
+
+        {view === 'database' && isAdmin && (
+          <DatabaseView showToast={showToast} />
+        )}
       </main>
       </div>
 
@@ -1365,6 +1379,7 @@ Return ONLY a JSON array (no preamble, no fences):
               draft={modal.draft}
               fromLibrary={modal.fromLibrary}
               onSave={(patch) => updateDraft(modal.draft.id, patch)}
+              onLearnFromEdits={learnFromEdits}
               onPublish={(options) => { publishDraft(modal.draft, options); }}
               onExport={() => setModal({ type: 'export', item: modal.draft })}
               onClose={() => setModal(null)}
@@ -1552,12 +1567,20 @@ Return ONLY a JSON array (no markdown fences, no preamble). Each item:
 }`;
 }
 
-function buildArticlePrompt(topic, instructions, style, linkingContext = '', categoryTraining = '') {
+function buildArticlePrompt(topic, instructions, style, linkingContext = '', categoryTraining = '', newsInstructions = '', mythbustInstructions = '') {
   const whyContext = topic.whyEvergreen || topic.whyNow || topic.theMyth || '';
   const myth = topic.theMyth ? `\n- The myth: ${topic.theMyth}` : '';
   const truth = topic.theTruth ? `\n- The evidence-backed truth: ${topic.theTruth}` : '';
   const catBlock = categoryTraining ? `\n\nCATEGORY-SPECIFIC TRAINING for "${topic.category}":\n${categoryTraining}` : '';
   const linkBlock = linkingContext ? `\n\n${linkingContext}` : '';
+
+  // Type-specific instruction overrides
+  let typeInstructionBlock = '';
+  if (topic.type === 'news' && newsInstructions?.trim()) {
+    typeInstructionBlock = `\n\nNEWS-SPECIFIC INSTRUCTIONS (applies to this news article):\n${newsInstructions}`;
+  } else if (topic.type === 'mythbusting' && mythbustInstructions?.trim()) {
+    typeInstructionBlock = `\n\nMYTHBUST-SPECIFIC INSTRUCTIONS (applies to this mythbust article):\n${mythbustInstructions}`;
+  }
 
   let lengthGuide = '1000–1400';
   let typeNote = '';
@@ -1568,7 +1591,7 @@ function buildArticlePrompt(topic, instructions, style, linkingContext = '', cat
     typeNote = `\n\nMYTHBUSTING STRUCTURE:\n1. Hook with the myth as a question or bold statement.\n2. Where the claim comes from (the source, the influencer, the cultural pattern).\n3. What the evidence actually says — peer-reviewed studies, SA bodies, experts.\n4. The nuanced truth — usually neither "always" nor "never".\n5. What to do instead (the practical takeaway).\n6. Bottom-line bullets.`;
   }
 
-  return `${instructions}${catBlock}
+  return `${instructions}${typeInstructionBlock}${catBlock}
 
 House style reference:
 ${style}${linkBlock}
@@ -1648,6 +1671,7 @@ function Sidebar({ view, setView, counts, currentUser, onLogout, theme, onToggle
       items: [
         { id: 'admin', label: 'Users', icon: Wand2 },
         { id: 'reports', label: 'Reports', icon: Beaker },
+        { id: 'database', label: 'Database', icon: FileCode },
       ],
     }] : []),
   ];
@@ -1759,6 +1783,286 @@ function TopBar({ onMenuClick, currentView }) {
 // PIPELINE VIEW (used for both Evergreen and News)
 // ============================================================================
 
+// ============================================================================
+// NEWS AUTOPILOT PANEL — scheduled cron-based news scouting
+// ============================================================================
+
+function NewsAutopilotPanel({ canApprove }) {
+  const [config, setConfig] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState(false);
+  const [runningNow, setRunningNow] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/news-autopilot/config', { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        setConfig(data.config);
+      }
+    } catch {}
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const saveConfig = async (patch) => {
+    setSaving(true);
+    try {
+      const res = await fetch('/api/news-autopilot/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(patch),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setConfig(data.config);
+        setSaveMsg('Saved');
+        setTimeout(() => setSaveMsg(null), 2000);
+      } else {
+        setSaveMsg('Save failed');
+      }
+    } catch (e) {
+      setSaveMsg(`Error: ${e.message}`);
+    }
+    setSaving(false);
+  };
+
+  const runNow = async () => {
+    if (!confirm('Run the news autopilot now? This will search the web and create new news topics. May take 30–90 seconds.')) return;
+    setRunningNow(true);
+    try {
+      const res = await fetch('/api/news-autopilot/run', {
+        method: 'POST', credentials: 'same-origin',
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setSaveMsg(`Done: created ${data.totalTopicsCreated || 0} topics`);
+        await load();
+      } else {
+        setSaveMsg(`Failed: ${data.error || res.status}`);
+      }
+    } catch (e) {
+      setSaveMsg(`Error: ${e.message}`);
+    }
+    setRunningNow(false);
+  };
+
+  if (loading || !config) {
+    return (
+      <div style={styles.autopilotPanel}>
+        <div style={styles.autopilotSummary}>Loading news autopilot…</div>
+      </div>
+    );
+  }
+
+  const targets = config.targetCategories || {};
+  const enabledCategories = Object.entries(targets).filter(([, c]) => c?.enabled);
+  const totalPieces = enabledCategories.reduce((s, [, c]) => s + (Number(c.count) || 0), 0);
+
+  const lastRunAgo = config.lastRun?.at
+    ? Math.floor((Date.now() - config.lastRun.at) / (60 * 60 * 1000))
+    : null;
+
+  // Categories user can configure
+  const ALL_CATEGORIES = [
+    'health_guides', 'women_s_health', 'men_s_health', 'preventive_health',
+    'fitness_training', 'diet_nutrition', 'mental_health', 'medications',
+    'supplements', 'kids_family', 'expert_directory', 'community_social',
+    'health_news', 'tools_calculators',
+  ];
+
+  return (
+    <div style={{ ...styles.autopilotPanel, ...(config.enabled ? styles.autopilotPanelActive : {}) }}>
+      <button
+        style={styles.autopilotHead}
+        onClick={() => setExpanded(e => !e)}
+      >
+        <div style={styles.autopilotHeadLeft}>
+          <div style={{ ...styles.autopilotStatus, background: config.enabled ? 'var(--c-green)' : 'var(--c-muted)' }} />
+          <div>
+            <div style={styles.autopilotTitle}>
+              News autopilot <span style={styles.autopilotStatusLabel}>
+                {config.enabled ? '· ON' : '· OFF'}
+              </span>
+            </div>
+            <div style={styles.autopilotSummary}>
+              {config.enabled
+                ? `Scheduled: midnight SAST daily · ${enabledCategories.length} categories · up to ${totalPieces} pieces per run`
+                : 'Not scheduled. Expand to configure and turn on.'}
+              {lastRunAgo !== null && lastRunAgo < 48 && (
+                <> · Last ran {lastRunAgo === 0 ? 'less than an hour' : `${lastRunAgo}h`} ago</>
+              )}
+            </div>
+          </div>
+        </div>
+        <div style={styles.autopilotHeadRight}>
+          {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        </div>
+      </button>
+
+      {expanded && (
+        <div style={styles.autopilotBody}>
+          {/* Master switch + run now */}
+          <div style={styles.autopilotRow}>
+            <label style={styles.autopilotCheckLabel}>
+              <input
+                type="checkbox"
+                checked={!!config.enabled}
+                onChange={e => saveConfig({ enabled: e.target.checked })}
+                disabled={!canApprove || saving}
+              />
+              <div>
+                <div style={styles.autopilotRowLabel}>Autopilot enabled</div>
+                <div style={styles.autopilotRowHint}>Runs automatically at 00:00 South African time every day</div>
+              </div>
+            </label>
+            {canApprove && (
+              <button
+                style={styles.secondaryBtn}
+                onClick={runNow}
+                disabled={runningNow}
+              >
+                {runningNow ? <Loader2 size={13} /> : <Zap size={13} />}
+                {runningNow ? 'Running…' : 'Run now'}
+              </button>
+            )}
+          </div>
+
+          <div style={styles.autopilotRow}>
+            <label style={styles.autopilotCheckLabel}>
+              <input
+                type="checkbox"
+                checked={config.autoWrite !== false}
+                onChange={e => saveConfig({ autoWrite: e.target.checked })}
+                disabled={!canApprove || saving}
+              />
+              <div>
+                <div style={styles.autopilotRowLabel}>Auto-write articles</div>
+                <div style={styles.autopilotRowHint}>Skip topic approval and go straight to writing — server worker generates the article automatically after scouting</div>
+              </div>
+            </label>
+          </div>
+
+          <div style={styles.autopilotRow}>
+            <div style={{ flex: 1 }}>
+              <div style={styles.autopilotRowLabel}>Look-back window</div>
+              <div style={styles.autopilotRowHint}>How far back to search for news</div>
+            </div>
+            <select
+              value={config.lookbackHours || 24}
+              onChange={e => saveConfig({ lookbackHours: parseInt(e.target.value, 10) })}
+              disabled={!canApprove || saving}
+              style={styles.autopilotSelect}
+            >
+              <option value={12}>Last 12 hours</option>
+              <option value={24}>Last 24 hours</option>
+              <option value={48}>Last 48 hours</option>
+              <option value={72}>Last 72 hours</option>
+            </select>
+          </div>
+
+          {/* Categories config */}
+          <div style={styles.autopilotSectionHead}>Categories</div>
+          <div style={styles.autopilotSectionHint}>
+            Set how many pieces to fetch per category, and optionally a focus keyword. Uncheck to skip a category.
+          </div>
+
+          <div style={styles.autopilotCatList}>
+            {ALL_CATEGORIES.map(catKey => {
+              const cat = targets[catKey] || { enabled: false, count: 5, focus: '' };
+              return (
+                <div key={catKey} style={{ ...styles.autopilotCatRow, ...(cat.enabled ? styles.autopilotCatRowActive : {}) }}>
+                  <label style={styles.autopilotCatCheck}>
+                    <input
+                      type="checkbox"
+                      checked={!!cat.enabled}
+                      onChange={e => saveConfig({
+                        targetCategories: {
+                          ...targets,
+                          [catKey]: { ...cat, enabled: e.target.checked },
+                        },
+                      })}
+                      disabled={!canApprove || saving}
+                    />
+                    <span style={styles.autopilotCatName}>{CATEGORY_LABELS[catKey] || catKey}</span>
+                  </label>
+
+                  <div style={styles.autopilotCatCount}>
+                    <label style={styles.autopilotCatSmallLabel}>Pieces</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={cat.count || 5}
+                      onChange={e => saveConfig({
+                        targetCategories: {
+                          ...targets,
+                          [catKey]: { ...cat, count: parseInt(e.target.value, 10) || 5 },
+                        },
+                      })}
+                      disabled={!canApprove || saving || !cat.enabled}
+                      style={styles.autopilotCatCountInput}
+                    />
+                  </div>
+
+                  <div style={{ flex: 1 }}>
+                    <label style={styles.autopilotCatSmallLabel}>Focus (optional)</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. NHI, load shedding health, PCOS…"
+                      value={cat.focus || ''}
+                      onBlur={e => saveConfig({
+                        targetCategories: {
+                          ...targets,
+                          [catKey]: { ...cat, focus: e.target.value },
+                        },
+                      })}
+                      onChange={e => {
+                        const val = e.target.value;
+                        setConfig(prev => ({
+                          ...prev,
+                          targetCategories: { ...targets, [catKey]: { ...cat, focus: val } },
+                        }));
+                      }}
+                      disabled={!canApprove || saving || !cat.enabled}
+                      style={styles.autopilotCatFocusInput}
+                    />
+                  </div>
+
+                  {cat.enabled && config.lastRun?.perCategory?.[catKey] && (
+                    <div style={styles.autopilotCatLastRun}>
+                      Last: {config.lastRun.perCategory[catKey].created}/{config.lastRun.perCategory[catKey].requested}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {saveMsg && <div style={styles.autopilotSaveMsg}>{saveMsg}</div>}
+
+          {/* Last run summary */}
+          {config.lastRun && (
+            <details style={styles.autopilotLastRun}>
+              <summary style={styles.autopilotLastRunSummary}>
+                Last run: {new Date(config.lastRun.at).toLocaleString('en-ZA')} · {config.lastRun.totalTopicsCreated} topics created · {config.lastRun.errors?.length || 0} errors
+              </summary>
+              <pre style={styles.autopilotLastRunDetails}>
+                {JSON.stringify(config.lastRun, null, 2)}
+              </pre>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PipelineView({
   type, seed, onSeedChange, topics, drafts,
   onGenerate, onApproveWrite, onRetryFailed, onRetryAllStuck, queueState,
@@ -1855,6 +2159,9 @@ function PipelineView({
           </button>
         </div>
       </div>
+
+      {/* News Autopilot panel (only visible on news view) */}
+      {type === 'news' && <NewsAutopilotPanel canApprove={canApprove} />}
 
       {/* SUB-TABS */}
       <div style={styles.subTabRow}>
@@ -2108,8 +2415,8 @@ function WriteQueueBanner({ queueState, failedCount, onRetryAll }) {
             </div>
           )}
           <div style={styles.queueBannerSub}>
-            {active && 'Articles generate 2 at a time. Keep this tab open until they finish.'}
-            {!active && failedCount > 0 && 'Tap retry to try them again — common causes are rate limits or the tab being closed mid-write.'}
+            {active && 'Articles are being written server-side. You can safely close the tab — writes continue in the background.'}
+            {!active && failedCount > 0 && 'Tap retry to requeue — the server worker will pick them up on its next run.'}
           </div>
         </div>
       </div>
@@ -2574,31 +2881,109 @@ function PromptEditor({ prompt, onSave, onCancel, onDelete }) {
 function SettingsView({ settings, onSave }) {
   const [instructions, setInstructions] = useState(settings.instructions);
   const [style, setStyle] = useState(settings.style);
-  const dirty = instructions !== settings.instructions || style !== settings.style;
+  const [newsInstructions, setNewsInstructions] = useState(settings.newsInstructions || '');
+  const [mythbustInstructions, setMythbustInstructions] = useState(settings.mythbustInstructions || '');
+  const [activeTab, setActiveTab] = useState('general');
+
+  const dirty = instructions !== settings.instructions ||
+    style !== settings.style ||
+    newsInstructions !== (settings.newsInstructions || '') ||
+    mythbustInstructions !== (settings.mythbustInstructions || '');
+
   return (
     <>
       <PageHead
         eyebrow="05"
         title="Voice & style"
-        sub="The instructions and style guide that ride along with every generation."
+        sub="Default instructions plus type-specific overrides for news and mythbust articles."
         action={dirty && (
-          <button style={styles.primaryBtn} onClick={() => onSave({ instructions, style })}>
+          <button style={styles.primaryBtn} onClick={() => onSave({ instructions, style, newsInstructions, mythbustInstructions })}>
             <Save size={16} /> Save
           </button>
         )}
       />
-      <div style={styles.settingsGrid}>
-        <div style={styles.settingsBlock}>
-          <label style={styles.settingsLabel}>System instructions</label>
-          <p style={styles.settingsHint}>Role, voice, localisation rules, and guardrails sent with every prompt.</p>
-          <textarea value={instructions} onChange={e => setInstructions(e.target.value)} style={styles.settingsArea} rows={18} />
-        </div>
-        <div style={styles.settingsBlock}>
-          <label style={styles.settingsLabel}>House style notes</label>
-          <p style={styles.settingsHint}>Reference style sheet for spelling, structure, sources, sensitivities.</p>
-          <textarea value={style} onChange={e => setStyle(e.target.value)} style={styles.settingsArea} rows={18} />
-        </div>
+
+      {/* Sub-tabs for content type */}
+      <div style={styles.settingsTabs}>
+        {[
+          { id: 'general', label: 'General & style', help: 'Applies to all content' },
+          { id: 'news', label: 'News-only overrides', help: 'Adds to general for news articles' },
+          { id: 'mythbust', label: 'Mythbust-only overrides', help: 'Adds to general for mythbust' },
+        ].map(t => (
+          <button
+            key={t.id}
+            onClick={() => setActiveTab(t.id)}
+            style={{ ...styles.settingsTab, ...(activeTab === t.id ? styles.settingsTabActive : {}) }}
+          >
+            <span>{t.label}</span>
+            <span style={styles.settingsTabHelp}>{t.help}</span>
+          </button>
+        ))}
       </div>
+
+      {activeTab === 'general' && (
+        <div style={styles.settingsGrid}>
+          <div style={styles.settingsBlock}>
+            <label style={styles.settingsLabel}>System instructions (all content types)</label>
+            <p style={styles.settingsHint}>Role, voice, localisation rules, and guardrails sent with every prompt. Applies to evergreen, news, and mythbust unless overridden.</p>
+            <textarea value={instructions} onChange={e => setInstructions(e.target.value)} style={styles.settingsArea} rows={18} />
+          </div>
+          <div style={styles.settingsBlock}>
+            <label style={styles.settingsLabel}>House style notes</label>
+            <p style={styles.settingsHint}>Reference style sheet for spelling, structure, sources, sensitivities. Applies to all content types.</p>
+            <textarea value={style} onChange={e => setStyle(e.target.value)} style={styles.settingsArea} rows={18} />
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'news' && (
+        <div style={styles.settingsBlock}>
+          <label style={styles.settingsLabel}>News-specific instructions</label>
+          <p style={styles.settingsHint}>
+            These are APPENDED to the general instructions when a news topic is being written.
+            Use for: newsroom voice, dateline conventions, source hierarchy for breaking events, angle guidance, tone shifts appropriate for time-sensitive stories.
+          </p>
+          <textarea
+            value={newsInstructions}
+            onChange={e => setNewsInstructions(e.target.value)}
+            placeholder={`Example:
+- Prefer SA news sources: SABC, Daily Maverick, News24, Business Day, Sunday Times, EWN
+- Lead with the SA angle even if the story is international
+- Include date/timestamps for all events referenced
+- Attribute claims to specific named sources — no anonymous framing
+- Prefer "According to a Daily Maverick report on 15 April 2026…"
+- Note if a story is still developing at time of writing
+- Include one quote from a named local expert or official where possible
+- Keep news articles 600–900 words, tight and factual
+- End with "What this means for readers" — 3–4 bullet takeaways`}
+            style={styles.settingsArea}
+            rows={22}
+          />
+        </div>
+      )}
+
+      {activeTab === 'mythbust' && (
+        <div style={styles.settingsBlock}>
+          <label style={styles.settingsLabel}>Mythbust-specific instructions</label>
+          <p style={styles.settingsHint}>
+            APPENDED to general instructions when a mythbusting article is being written.
+            Use for: evidence hierarchy, red-flag phrasing to challenge, expected structure, tone (respectful not smug).
+          </p>
+          <textarea
+            value={mythbustInstructions}
+            onChange={e => setMythbustInstructions(e.target.value)}
+            placeholder={`Example:
+- Structure: state the myth → where it comes from → what the evidence says → nuanced truth → practical takeaway
+- Evidence hierarchy: peer-reviewed studies > SA health authorities > international bodies > expert quotes > user-reported anecdotes
+- Cite specific studies with year and journal
+- Avoid smug or dismissive tone — some myths persist because they contain a grain of truth
+- Address why the myth is compelling before debunking
+- Be honest when the evidence is genuinely mixed`}
+            style={styles.settingsArea}
+            rows={22}
+          />
+        </div>
+      )}
     </>
   );
 }
@@ -2642,14 +3027,29 @@ function ErrorPanel({ message, onClose }) {
   );
 }
 
-function DraftView({ draft, fromLibrary, onSave, onPublish, onExport, onClose, showToast }) {
+function DraftView({ draft, fromLibrary, onSave, onLearnFromEdits, onPublish, onExport, onClose, showToast }) {
   const [content, setContent] = useState(draft.content);
   const [editing, setEditing] = useState(false);
-  const [confirmStep, setConfirmStep] = useState(null); // null | 'learn-prompt'
+  const [confirmStep, setConfirmStep] = useState(null); // null | 'learn-prompt' | 'save-train-prompt'
   const originalContent = draft.content; // snapshot at open time
   const hasEdits = content.trim() !== originalContent.trim();
 
-  const save = () => { onSave({ content }); setEditing(false); showToast('Draft saved', 'success'); };
+  // Quiet save (no prompt) — used by "Save only" or when there are no edits
+  const doSaveSilent = () => {
+    onSave({ content });
+    setEditing(false);
+    showToast('Draft saved', 'success');
+  };
+
+  // Save handler: if edits exist, prompt to train AI; otherwise just save
+  const save = () => {
+    if (hasEdits && onLearnFromEdits) {
+      setConfirmStep('save-train-prompt');
+    } else {
+      doSaveSilent();
+    }
+  };
+
   const copy = async () => {
     try { await navigator.clipboard.writeText(content); showToast('Copied'); }
     catch { showToast('Copy failed', 'error'); }
@@ -2678,7 +3078,51 @@ function DraftView({ draft, fromLibrary, onSave, onPublish, onExport, onClose, s
         <button style={styles.iconBtn} onClick={onClose}><X size={18} /></button>
       </div>
 
-      {confirmStep === 'learn-prompt' ? (
+      {confirmStep === 'save-train-prompt' ? (
+        <div style={styles.learnPrompt}>
+          <div style={styles.learnPromptIcon}><GraduationCap size={28} /></div>
+          <h3 style={styles.learnPromptTitle}>You edited the article — teach the AI?</h3>
+          <p style={styles.learnPromptBody}>
+            Save now, and I can also compare your edited version to the original AI draft to extract 1–3 patterns. Future articles in the <strong>{draft.category}</strong> category will follow your preferences automatically.
+          </p>
+          <div style={styles.learnPromptActions}>
+            <button
+              style={styles.secondaryBtn}
+              onClick={() => {
+                onSave({ content });
+                setEditing(false);
+                setConfirmStep(null);
+                showToast('Draft saved (no training)', 'success');
+              }}
+            >
+              Save only
+            </button>
+            <button
+              style={styles.primaryBtn}
+              onClick={async () => {
+                onSave({ content });
+                setEditing(false);
+                setConfirmStep(null);
+                showToast('Saved. Training from your edits…', 'success');
+                try {
+                  await onLearnFromEdits(originalContent, content, draft.category, draft.title);
+                  showToast('Training added to category', 'success');
+                } catch (e) {
+                  showToast(`Training failed: ${(e?.message || e).slice(0, 80)}`, 'error');
+                }
+              }}
+            >
+              <GraduationCap size={15} /> Save & train AI
+            </button>
+          </div>
+          <button
+            style={styles.learnPromptCancel}
+            onClick={() => setConfirmStep(null)}
+          >
+            ← Back to editing
+          </button>
+        </div>
+      ) : confirmStep === 'learn-prompt' ? (
         <div style={styles.learnPrompt}>
           <div style={styles.learnPromptIcon}><GraduationCap size={28} /></div>
           <h3 style={styles.learnPromptTitle}>You made edits — want to learn from them?</h3>
@@ -3663,6 +4107,336 @@ function LoginScreen({ onLogin, theme = 'light' }) {
 // ADMIN VIEW
 // ============================================================================
 
+// ============================================================================
+// DATABASE VIEW — admin tool to inspect / clear / load KV tables
+// ============================================================================
+
+function DatabaseView({ showToast }) {
+  const [snapshot, setSnapshot] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(null); // key currently being modified
+
+  // Load target for pastes
+  const [loadTargetKey, setLoadTargetKey] = useState('sitePages');
+  const [pasteJson, setPasteJson] = useState('');
+  const [pastePreview, setPastePreview] = useState(null);
+
+  const loadSnapshot = async () => {
+    setLoading(true);
+    const keys = ['topics', 'drafts', 'library', 'sitePages', 'activity', 'settings', 'prompts', 'categoryTraining', 'training'];
+    const results = {};
+    for (const key of keys) {
+      try {
+        const res = await fetch('/api/data/' + key, { credentials: 'same-origin' });
+        if (!res.ok) { results[key] = { error: `HTTP ${res.status}` }; continue; }
+        const data = await res.json();
+        const val = data.value;
+        if (Array.isArray(val)) {
+          results[key] = { type: 'array', count: val.length, size: JSON.stringify(val).length };
+        } else if (val && typeof val === 'object') {
+          results[key] = { type: 'object', count: Object.keys(val).length, size: JSON.stringify(val).length };
+        } else {
+          results[key] = { type: 'empty', count: 0, size: 0 };
+        }
+      } catch (e) {
+        results[key] = { error: e.message };
+      }
+    }
+    // Also activity via its own endpoint (which returns { events })
+    try {
+      const res = await fetch('/api/activity', { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        results.activity = { type: 'array', count: (data.events || []).length, size: JSON.stringify(data.events || []).length };
+      }
+    } catch {}
+    setSnapshot(results);
+    setLoading(false);
+  };
+
+  useEffect(() => { loadSnapshot(); }, []);
+
+  const doClear = async (key, label) => {
+    if (!confirm(`Clear "${label}"? This cannot be undone. Snapshot: ${snapshot[key]?.count || 0} items.`)) return;
+    setBusy(key);
+    try {
+      let res;
+      if (key === 'activity') {
+        res = await fetch('/api/activity', { method: 'DELETE', credentials: 'same-origin' });
+      } else {
+        const emptyValue = ['settings', 'prompts', 'categoryTraining'].includes(key) ? {} : [];
+        res = await fetch('/api/data/' + key, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ value: emptyValue }),
+        });
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      showToast(`Cleared ${label}`, 'success');
+      await loadSnapshot();
+    } catch (e) {
+      showToast(`Failed to clear ${label}: ${e.message}`, 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Clear topics/drafts/library filtered by content type
+  const doClearByType = async (contentType) => {
+    if (!confirm(`Clear all ${contentType} topics, drafts, and library items? News and mythbust untouched.`)) return;
+    setBusy(`type:${contentType}`);
+    try {
+      for (const key of ['topics', 'drafts', 'library']) {
+        const res = await fetch('/api/data/' + key, { credentials: 'same-origin' });
+        const data = await res.json();
+        const filtered = (data.value || []).filter(x => x.type !== contentType);
+        await fetch('/api/data/' + key, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ value: filtered }),
+        });
+      }
+      showToast(`Cleared all ${contentType} content`, 'success');
+      await loadSnapshot();
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Preview paste JSON
+  const previewPaste = () => {
+    setPastePreview(null);
+    if (!pasteJson.trim()) return;
+    try {
+      const parsed = JSON.parse(pasteJson);
+      let summary;
+      if (Array.isArray(parsed)) {
+        summary = { valid: true, type: 'array', count: parsed.length, sample: parsed[0] };
+      } else if (parsed && typeof parsed === 'object') {
+        summary = { valid: true, type: 'object', count: Object.keys(parsed).length, sample: parsed };
+      } else {
+        summary = { valid: false, error: 'JSON must be array or object' };
+      }
+      setPastePreview(summary);
+    } catch (e) {
+      setPastePreview({ valid: false, error: e.message });
+    }
+  };
+
+  useEffect(() => { previewPaste(); }, [pasteJson]);
+
+  const doPaste = async (mode) => {
+    if (!pastePreview?.valid) return;
+    if (!confirm(`${mode === 'replace' ? 'REPLACE' : 'MERGE'} "${loadTargetKey}" with ${pastePreview.count} ${pastePreview.type === 'array' ? 'items' : 'keys'}?`)) return;
+    setBusy('paste');
+    try {
+      let value = JSON.parse(pasteJson);
+      if (mode === 'merge') {
+        const cur = await fetch('/api/data/' + loadTargetKey, { credentials: 'same-origin' }).then(r => r.json());
+        if (Array.isArray(value)) {
+          value = [...(cur.value || []), ...value];
+        } else {
+          value = { ...(cur.value || {}), ...value };
+        }
+      }
+      const res = await fetch('/api/data/' + loadTargetKey, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ value }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      showToast(`${mode === 'replace' ? 'Replaced' : 'Merged into'} ${loadTargetKey}`, 'success');
+      setPasteJson('');
+      setPastePreview(null);
+      await loadSnapshot();
+    } catch (e) {
+      showToast(`Failed: ${e.message}`, 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Trigger the queue worker manually
+  const runWorker = async () => {
+    setBusy('worker');
+    try {
+      const res = await fetch('/api/queue/process', { method: 'POST', credentials: 'same-origin' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      const processed = data.processed || 0;
+      if (data.skipped) {
+        showToast(`Worker skipped: ${data.reason}`, 'success');
+      } else {
+        showToast(`Worker ran: processed ${processed} ${processed === 1 ? 'topic' : 'topics'}`, 'success');
+      }
+      await loadSnapshot();
+    } catch (e) {
+      showToast(`Worker failed: ${e.message}`, 'error');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+
+  // Config
+  const KEYS = [
+    { key: 'topics', label: 'Topics', danger: true, note: 'The content pipeline' },
+    { key: 'drafts', label: 'Drafts', danger: true, note: 'Articles waiting for review' },
+    { key: 'library', label: 'Library', danger: true, note: 'Published articles' },
+    { key: 'sitePages', label: 'Sitemap', danger: true, note: 'Site navigation pages' },
+    { key: 'activity', label: 'Activity log', danger: false, note: 'Reports data' },
+    { key: 'settings', label: 'Settings', danger: false, note: 'Voice + house style (careful!)' },
+    { key: 'prompts', label: 'Saved prompts', danger: false, note: 'Your saved prompts' },
+    { key: 'categoryTraining', label: 'Category training', danger: false, note: 'Per-category writing rules' },
+    { key: 'training', label: 'Training events', danger: false, note: 'Learn-from-edits history' },
+  ];
+
+  return (
+    <>
+      <PageHead
+        eyebrow="09 · Database"
+        title="Database"
+        sub="Direct access to your app's data tables. Clear, inspect, or bulk-load JSON without leaving the app."
+        action={
+          <button style={styles.secondaryBtn} onClick={loadSnapshot} disabled={loading}>
+            <RefreshCw size={13} /> Refresh
+          </button>
+        }
+      />
+
+      {/* Server worker controls */}
+      <section style={styles.dbSection}>
+        <h2 style={styles.dbSectionTitle}>Write queue worker</h2>
+        <p style={styles.dbSectionSub}>Runs every minute via Vercel Cron. Tap to run immediately.</p>
+        <button style={styles.primaryBtn} onClick={runWorker} disabled={busy === 'worker'}>
+          {busy === 'worker' ? <Loader2 size={13} /> : <Zap size={13} />}
+          {busy === 'worker' ? 'Running worker…' : 'Run worker now'}
+        </button>
+      </section>
+
+      {/* Snapshot */}
+      <section style={styles.dbSection}>
+        <h2 style={styles.dbSectionTitle}>Data snapshot</h2>
+        {loading && !snapshot ? (
+          <div style={styles.dbLoading}>Loading…</div>
+        ) : (
+          <div style={styles.dbTable}>
+            <div style={{ ...styles.dbRow, ...styles.dbRowHead }}>
+              <div style={{ flex: 2 }}>Table</div>
+              <div style={{ flex: 1 }}>Items</div>
+              <div style={{ flex: 1 }}>Size</div>
+              <div style={{ flex: 2, textAlign: 'right' }}>Action</div>
+            </div>
+            {KEYS.map(k => {
+              const s = snapshot?.[k.key] || { count: 0, size: 0 };
+              const isBusy = busy === k.key;
+              return (
+                <div key={k.key} style={styles.dbRow}>
+                  <div style={{ flex: 2 }}>
+                    <div style={styles.dbKeyName}>{k.label}</div>
+                    <div style={styles.dbKeyNote}>{k.note}</div>
+                  </div>
+                  <div style={{ flex: 1, fontFamily: 'ui-monospace, monospace', fontSize: 13 }}>{s.count}</div>
+                  <div style={{ flex: 1, fontFamily: 'ui-monospace, monospace', fontSize: 12, color: colors.muted }}>{fmtBytes(s.size || 0)}</div>
+                  <div style={{ flex: 2, textAlign: 'right' }}>
+                    <button
+                      style={k.danger ? styles.dbBtnDanger : styles.dbBtnSubtle}
+                      onClick={() => doClear(k.key, k.label)}
+                      disabled={isBusy || s.count === 0}
+                    >
+                      {isBusy ? <Loader2 size={12} /> : <Trash2 size={12} />}
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Clear by content type */}
+      <section style={styles.dbSection}>
+        <h2 style={styles.dbSectionTitle}>Clear by content type</h2>
+        <p style={styles.dbSectionSub}>Removes topics, drafts, and library items of a specific type. Other types unaffected.</p>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button style={styles.dbBtnByType} onClick={() => doClearByType('evergreen')} disabled={busy === 'type:evergreen'}>
+            Clear all Evergreen
+          </button>
+          <button style={styles.dbBtnByType} onClick={() => doClearByType('news')} disabled={busy === 'type:news'}>
+            Clear all News
+          </button>
+          <button style={styles.dbBtnByType} onClick={() => doClearByType('mythbusting')} disabled={busy === 'type:mythbusting'}>
+            Clear all Mythbust
+          </button>
+        </div>
+      </section>
+
+      {/* Bulk load JSON */}
+      <section style={styles.dbSection}>
+        <h2 style={styles.dbSectionTitle}>Load JSON</h2>
+        <p style={styles.dbSectionSub}>Paste an array or object and load it into a specific table. Preview shown before commit.</p>
+
+        <label style={styles.formLabel}>Target table</label>
+        <select value={loadTargetKey} onChange={e => setLoadTargetKey(e.target.value)} style={styles.topicInput}>
+          <option value="topics">Topics (array)</option>
+          <option value="drafts">Drafts (array)</option>
+          <option value="library">Library (array)</option>
+          <option value="sitePages">Sitemap (array)</option>
+          <option value="settings">Settings (object)</option>
+          <option value="categoryTraining">Category training (object)</option>
+          <option value="prompts">Saved prompts (object)</option>
+        </select>
+
+        <label style={{ ...styles.formLabel, marginTop: 12 }}>JSON payload</label>
+        <textarea
+          value={pasteJson}
+          onChange={e => setPasteJson(e.target.value)}
+          placeholder='[{"id":"...","title":"..."}]'
+          style={{ ...styles.textarea, minHeight: 140, fontFamily: 'ui-monospace, monospace', fontSize: 12 }}
+        />
+
+        {pastePreview && (
+          <div style={{
+            ...styles.dbPreview,
+            ...(pastePreview.valid ? {} : styles.dbPreviewError),
+          }}>
+            {pastePreview.valid ? (
+              <>
+                <div style={styles.dbPreviewOk}>
+                  ✓ Valid {pastePreview.type} · {pastePreview.count} {pastePreview.type === 'array' ? 'items' : 'keys'}
+                </div>
+                {pastePreview.sample && (
+                  <div style={styles.dbPreviewSample}>
+                    Sample: <code style={styles.dbPreviewCode}>{JSON.stringify(pastePreview.sample).slice(0, 180)}…</code>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div style={styles.dbPreviewErr}>✗ Invalid: {pastePreview.error}</div>
+            )}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <button style={styles.dbBtnDanger} onClick={() => doPaste('replace')} disabled={!pastePreview?.valid || busy === 'paste'}>
+            Replace
+          </button>
+          <button style={styles.secondaryBtn} onClick={() => doPaste('merge')} disabled={!pastePreview?.valid || busy === 'paste'}>
+            Merge / append
+          </button>
+        </div>
+      </section>
+    </>
+  );
+}
+
 function AdminView({ currentUser, showToast }) {
   const [users, setUsers] = useState(null);
   const [creating, setCreating] = useState(false);
@@ -4406,7 +5180,7 @@ function MonthHeatmap({ daysInMonth, dayOfMonth, deployedByDay, dailyTotalTarget
 // SITEMAP / TOPICAL AUTHORITY
 // ============================================================================
 
-function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster, onLoadBlueprint, canApprove }) {
+function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster, onUpdateCategory, onLoadBlueprint, canApprove }) {
   const [viewMode, setViewMode] = useState('list'); // 'list' | 'visual'
   const [collapsed, setCollapsed] = useState({});
   const [typeFilter, setTypeFilter] = useState('evergreen'); // 'all' | 'evergreen' | 'news' | 'mythbusting'
@@ -4648,6 +5422,7 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
           setCollapsed={setCollapsed}
           onEdit={onEdit}
           onDelete={onDelete}
+          onUpdateCategory={onUpdateCategory}
         />
       )}
     </>
@@ -4771,8 +5546,10 @@ function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDe
                         <TreePage
                           key={item.id}
                           item={item}
+                          currentCategory={cat}
                           onEdit={item.kind === 'page' ? () => onEdit(item) : null}
                           onDelete={item.kind === 'page' ? () => onDelete(item.id) : null}
+                          onUpdateCategory={onUpdateCategory}
                         />
                       ))}
                     </div>
@@ -4787,7 +5564,8 @@ function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDe
   );
 }
 
-function TreePage({ item, onEdit, onDelete }) {
+function TreePage({ item, currentCategory, onEdit, onDelete, onUpdateCategory }) {
+  const [pickerOpen, setPickerOpen] = useState(false);
   const STATUS_LABELS = {
     LIVE: 'live',
     DEPLOYED: 'deployed',
@@ -4797,6 +5575,13 @@ function TreePage({ item, onEdit, onDelete }) {
     PLANNED: 'planned',
   };
   const statusClass = (item._status || '').toLowerCase();
+
+  const canMove = !!onUpdateCategory;
+  const otherCategories = canMove
+    ? Object.keys(CATEGORY_LABELS)
+      .filter(k => k !== currentCategory && k !== 'uncategorised')
+      .sort((a, b) => CATEGORY_LABELS[a].localeCompare(CATEGORY_LABELS[b]))
+    : [];
 
   return (
     <div style={styles.treePage}>
@@ -4808,8 +5593,39 @@ function TreePage({ item, onEdit, onDelete }) {
           <ExternalLink size={11} />
         </a>
       )}
-      {(onEdit || onDelete) && (
+      {(onEdit || onDelete || canMove) && (
         <div style={styles.treePageActions}>
+          {canMove && (
+            <div style={{ position: 'relative', display: 'inline-flex' }}>
+              <button
+                style={styles.iconBtnSm}
+                onClick={() => setPickerOpen(o => !o)}
+                title="Move to another category"
+              >
+                <ArrowRight size={11} />
+              </button>
+              {pickerOpen && (
+                <>
+                  <div style={styles.movePickerBackdrop} onClick={() => setPickerOpen(false)} />
+                  <div style={styles.movePicker}>
+                    <div style={styles.movePickerHead}>Move to category</div>
+                    {otherCategories.map(catKey => (
+                      <button
+                        key={catKey}
+                        style={styles.movePickerItem}
+                        onClick={() => {
+                          onUpdateCategory(item, item.kind === 'page' ? 'sitePage' : item.kind, catKey);
+                          setPickerOpen(false);
+                        }}
+                      >
+                        {CATEGORY_LABELS[catKey]}
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           {onEdit && <button style={styles.iconBtnSm} onClick={onEdit} title="Edit"><Edit3 size={11} /></button>}
           {onDelete && <button style={styles.iconBtnSm} onClick={onDelete} title="Delete"><Trash2 size={11} /></button>}
         </div>
@@ -5403,6 +6219,159 @@ const styles = {
   targetGroup: { display: 'inline-flex', alignItems: 'center', gap: 4, background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '2px 2px 2px 4px' },
   targetTypeBadge: { fontSize: 9.5, fontWeight: 700, padding: '2px 5px', borderRadius: 3, letterSpacing: '0.05em', lineHeight: 1 },
   targetSelect: { padding: '3px 4px 3px 6px', fontSize: 12.5, border: 'none', background: 'transparent', fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600, cursor: 'pointer', outline: 'none' },
+
+  // === NEWS AUTOPILOT ===
+  autopilotPanel: {
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 8, marginBottom: 14, overflow: 'hidden',
+  },
+  autopilotPanelActive: { borderColor: colors.green, borderLeftWidth: 3 },
+  autopilotHead: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    gap: 12, width: '100%', padding: '14px 16px',
+    background: colors.surface, border: 'none', textAlign: 'left',
+    fontFamily: fonts.body, color: colors.ink, cursor: 'pointer',
+  },
+  autopilotHeadLeft: { display: 'flex', alignItems: 'center', gap: 12, flex: 1, minWidth: 0 },
+  autopilotHeadRight: { color: colors.muted, display: 'flex', alignItems: 'center' },
+  autopilotStatus: { width: 10, height: 10, borderRadius: '50%', flexShrink: 0 },
+  autopilotTitle: { fontSize: 14, fontWeight: 600, letterSpacing: '-0.005em' },
+  autopilotStatusLabel: { fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', color: colors.muted, textTransform: 'uppercase' },
+  autopilotSummary: { fontSize: 12, color: colors.muted, marginTop: 2, lineHeight: 1.4 },
+  autopilotBody: {
+    padding: '4px 16px 18px', borderTop: `1px solid ${colors.borderSoft}`,
+  },
+  autopilotRow: {
+    display: 'flex', alignItems: 'center', gap: 12,
+    padding: '12px 0', borderBottom: `1px solid ${colors.borderSoft}`,
+  },
+  autopilotCheckLabel: {
+    display: 'flex', alignItems: 'flex-start', gap: 10,
+    cursor: 'pointer', flex: 1, minWidth: 0,
+  },
+  autopilotRowLabel: { fontSize: 13, fontWeight: 600, color: colors.ink },
+  autopilotRowHint: { fontSize: 11.5, color: colors.muted, marginTop: 1, lineHeight: 1.4 },
+  autopilotSelect: {
+    padding: '6px 10px', fontSize: 12.5, border: `1px solid ${colors.border}`,
+    borderRadius: 4, background: colors.inputBg, color: colors.ink, fontFamily: fonts.body,
+  },
+  autopilotSectionHead: {
+    fontSize: 11, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase',
+    color: colors.muted, marginTop: 14, marginBottom: 3,
+  },
+  autopilotSectionHint: { fontSize: 12, color: colors.muted, marginBottom: 8, lineHeight: 1.4 },
+  autopilotCatList: { display: 'flex', flexDirection: 'column', gap: 4 },
+  autopilotCatRow: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '8px 10px', background: colors.bg,
+    border: `1px solid ${colors.borderSoft}`, borderRadius: 5,
+    fontSize: 12.5, flexWrap: 'wrap',
+  },
+  autopilotCatRowActive: { borderColor: colors.green, background: 'rgba(45,95,78,0.04)' },
+  autopilotCatCheck: {
+    display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+    flex: '1 1 180px', minWidth: 0,
+  },
+  autopilotCatName: { fontSize: 12.5, fontWeight: 500, color: colors.ink },
+  autopilotCatCount: { display: 'flex', flexDirection: 'column', gap: 2, flexShrink: 0 },
+  autopilotCatSmallLabel: {
+    fontSize: 9.5, fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase',
+    color: colors.muted,
+  },
+  autopilotCatCountInput: {
+    width: 52, padding: '4px 6px', fontSize: 12.5, textAlign: 'center',
+    border: `1px solid ${colors.border}`, borderRadius: 4,
+    background: colors.inputBg, fontFamily: 'ui-monospace, monospace',
+    color: colors.ink, fontWeight: 600,
+  },
+  autopilotCatFocusInput: {
+    width: '100%', padding: '4px 8px', fontSize: 12,
+    border: `1px solid ${colors.border}`, borderRadius: 4,
+    background: colors.inputBg, color: colors.ink, fontFamily: fonts.body,
+    boxSizing: 'border-box',
+  },
+  autopilotCatLastRun: {
+    fontSize: 10.5, fontWeight: 600, color: colors.green,
+    background: 'rgba(45,95,78,0.1)', padding: '3px 6px', borderRadius: 3,
+    fontFamily: 'ui-monospace, monospace',
+  },
+  autopilotSaveMsg: {
+    fontSize: 12, fontWeight: 600, color: colors.green,
+    padding: '8px 10px', background: 'rgba(45,95,78,0.08)',
+    borderRadius: 4, marginTop: 10, textAlign: 'center',
+  },
+  autopilotLastRun: {
+    marginTop: 12, padding: '8px 10px', background: colors.bg,
+    borderRadius: 5, fontSize: 12,
+  },
+  autopilotLastRunSummary: { cursor: 'pointer', color: colors.muted, fontSize: 11.5 },
+  autopilotLastRunDetails: {
+    marginTop: 8, padding: 10, background: colors.surface,
+    fontFamily: 'ui-monospace, monospace', fontSize: 10.5,
+    color: colors.muted, borderRadius: 4, overflow: 'auto', maxHeight: 300,
+  },
+
+  // === SETTINGS TABS ===
+  settingsTabs: { display: 'flex', gap: 6, marginBottom: 16, flexWrap: 'wrap' },
+  settingsTab: {
+    display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2,
+    padding: '10px 14px', background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 6, cursor: 'pointer', fontFamily: fonts.body,
+    color: colors.muted, fontSize: 12.5, fontWeight: 500, textAlign: 'left', flex: '1 1 200px',
+  },
+  settingsTabActive: {
+    borderColor: colors.green, background: colors.bg, color: colors.ink, fontWeight: 600,
+  },
+  settingsTabHelp: { fontSize: 10.5, color: colors.faint, fontWeight: 400 },
+
+  // === MOVE-TO-CATEGORY PICKER ===
+  movePickerBackdrop: {
+    position: 'fixed', inset: 0, background: 'transparent', zIndex: 100,
+  },
+  movePicker: {
+    position: 'absolute', top: 22, right: -4,
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 6, boxShadow: '0 6px 20px rgba(0,0,0,0.15)',
+    zIndex: 101, minWidth: 200, padding: 4,
+    maxHeight: 320, overflowY: 'auto',
+  },
+  movePickerHead: {
+    fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase',
+    letterSpacing: '0.06em', color: colors.muted, padding: '8px 10px 4px',
+  },
+  movePickerItem: {
+    display: 'block', width: '100%', padding: '8px 10px',
+    background: 'transparent', border: 'none', borderRadius: 3,
+    fontFamily: fonts.body, fontSize: 12.5, color: colors.ink,
+    textAlign: 'left', cursor: 'pointer',
+  },
+
+  // === LEARN PROMPT CANCEL ===
+  learnPromptCancel: {
+    display: 'block', margin: '16px auto 0', padding: '4px 8px',
+    background: 'transparent', border: 'none', color: colors.muted,
+    fontSize: 12, fontFamily: fonts.body, cursor: 'pointer', textDecoration: 'underline',
+  },
+
+  // === DATABASE VIEW ===
+  dbSection: { background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 8, padding: 20, marginBottom: 16 },
+  dbSectionTitle: { fontSize: 15, fontWeight: 600, margin: '0 0 4px', color: colors.ink },
+  dbSectionSub: { fontSize: 12.5, color: colors.muted, margin: '0 0 14px', lineHeight: 1.5 },
+  dbLoading: { padding: 20, color: colors.muted, fontSize: 13, textAlign: 'center' },
+  dbTable: { display: 'flex', flexDirection: 'column', gap: 1, background: colors.borderSoft, border: `1px solid ${colors.borderSoft}`, borderRadius: 6, overflow: 'hidden' },
+  dbRow: { display: 'flex', gap: 12, alignItems: 'center', padding: '10px 14px', background: colors.surface },
+  dbRowHead: { background: colors.bg, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em', color: colors.muted, fontWeight: 600 },
+  dbKeyName: { fontSize: 13.5, fontWeight: 600, color: colors.ink },
+  dbKeyNote: { fontSize: 11, color: colors.muted, marginTop: 1 },
+  dbBtnDanger: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 10px', fontSize: 11.5, fontWeight: 600, background: 'rgba(161, 68, 56, 0.08)', color: '#A14438', border: '1px solid rgba(161, 68, 56, 0.3)', borderRadius: 4, fontFamily: fonts.body, cursor: 'pointer' },
+  dbBtnSubtle: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 10px', fontSize: 11.5, fontWeight: 500, background: colors.bg, color: colors.muted, border: `1px solid ${colors.border}`, borderRadius: 4, fontFamily: fonts.body, cursor: 'pointer' },
+  dbBtnByType: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '10px 14px', fontSize: 12.5, fontWeight: 600, background: colors.bg, color: colors.ink, border: `1px solid ${colors.border}`, borderRadius: 5, fontFamily: fonts.body, cursor: 'pointer' },
+  dbPreview: { padding: '10px 12px', background: colors.bg, border: `1px solid ${colors.borderSoft}`, borderRadius: 5, marginTop: 10, fontSize: 12 },
+  dbPreviewError: { background: 'rgba(161, 68, 56, 0.06)', borderColor: 'rgba(161, 68, 56, 0.3)' },
+  dbPreviewOk: { color: colors.green, fontWeight: 600, marginBottom: 4 },
+  dbPreviewErr: { color: '#A14438', fontWeight: 600 },
+  dbPreviewSample: { fontSize: 11, color: colors.muted, marginTop: 4 },
+  dbPreviewCode: { fontFamily: 'ui-monospace, monospace', background: colors.surface, padding: '1px 4px', borderRadius: 3, fontSize: 11 },
 
   // === WRITE QUEUE / RETRY ===
   queueBanner: {

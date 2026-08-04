@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/queue/process",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/news-autopilot/run",
+      "schedule": "0 22 * * *"
+    }
+  ]
+}

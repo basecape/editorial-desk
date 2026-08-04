@@ -33,8 +33,14 @@ export async function GET(req) {
   }
 
   if (!username || !password) {
+    const users = (await kv.get('users')) || [];
+    const available = users.map(u => ({ username: u.username, role: u.role, name: u.name }));
     return new Response(
-      JSON.stringify({ error: 'Missing parameters. Required: username, password' }),
+      JSON.stringify({
+        error: 'Missing parameters. Required: username, password',
+        availableUsers: available,
+        hint: 'Add &username=USERNAME&password=NEWPASSWORD to your URL.',
+      }, null, 2),
       { status: 400, headers: { 'Content-Type': 'application/json' } }
     );
   }
