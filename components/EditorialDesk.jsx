@@ -774,13 +774,13 @@ export default function EditorialDesk() {
         id: uid(),
         type,
         seed,
-        status: 'pending',
+        status: 'research',
         createdAt: Date.now()
       }));
       addTopics(newTopics);
       logAction('topic.generate', { count: newTopics.length, type, seed });
       setModal(null);
-      showToast(`${newTopics.length} topics ready`, 'success');
+      showToast(`${newTopics.length} topics ready for review in Research`, 'success');
     } catch (e) {
       setModal({ type: 'error', message: e.message });
     }
@@ -795,13 +795,14 @@ export default function EditorialDesk() {
   const [queueState, setQueueState] = useState({ waiting: 0, inFlight: 0 });
 
   const writeArticle = async (topic) => {
-    // Just mark as queued in KV. The server worker will pick it up.
+    // Mark as queued and kick off the server worker immediately.
     updateTopic(topic.id, { status: 'queued', error: null, queuedAt: Date.now() });
-    showToast(`Queued "${topic.title.slice(0, 40)}…" — writing server-side`, 'success');
-    // Optional: nudge the worker to run immediately instead of waiting for cron
+    showToast(`Writing "${topic.title.slice(0, 40)}…" — server started`, 'success');
+    // Fire-and-forget the worker so writing starts within seconds.
+    // If this fails, the cron will pick it up on its next tick.
     try {
       fetch('/api/queue/process', { method: 'POST', credentials: 'same-origin' })
-        .catch(() => {}); // fire and forget; cron will still catch it
+        .catch(() => {});
     } catch {}
   };
 
@@ -1285,12 +1286,61 @@ Return ONLY a JSON array (no preamble, no fences):
           />
         )}
 
+        {(view === 'research-evergreen' || view === 'research-news' || view === 'research-mythbusting') && (
+          <ResearchView
+            type={view.replace('research-', '')}
+            seed={seeds[view.replace('research-', '')]}
+            onSeedChange={(v) => setSeeds(s => ({ ...s, [view.replace('research-', '')]: v }))}
+            onGenerate={(count) => generateTopics(view.replace('research-', ''), seeds[view.replace('research-', '')], count)}
+            sitePages={sitePages}
+            drafts={drafts}
+            libraryItems={libraryItems}
+            topics={topics}
+            onAddToSitemap={(topic) => {
+              // Create a sitemap page from the topic — tagged with type so clear-by-type finds it
+              const newPage = {
+                id: uid(),
+                title: topic.title,
+                url: '',
+                keyword: topic.keyword || '',
+                cluster: topic.cluster || 'Unclustered',
+                category: topic.category || '',
+                type: topic.type,
+                addedAt: Date.now(),
+                fromResearch: true,
+                sourceTopicId: topic.id,
+              };
+              setSitePages(prev => {
+                const next = [newPage, ...prev];
+                storage.set('sitePages', next);
+                return next;
+              });
+              // Also add as a pending topic in the pipeline
+              const topicClean = { ...topic, status: 'pending', addedToSitemap: true, addedAt: Date.now() };
+              setTopics(prev => {
+                const next = [topicClean, ...prev.filter(t => t.id !== topic.id)];
+                storage.set('topics', next);
+                return next;
+              });
+              showToast(`Added "${topic.title.slice(0, 40)}…" to sitemap and pipeline`, 'success');
+            }}
+            onDiscardResearchTopic={(topicId) => {
+              setTopics(prev => {
+                const next = prev.filter(t => t.id !== topicId);
+                storage.set('topics', next);
+                return next;
+              });
+            }}
+            canApprove={canApprove}
+          />
+        )}
+
         {(view === 'evergreen' || view === 'news' || view === 'mythbusting') && (
           <PipelineView
             type={view}
             seed={seeds[view]}
             onSeedChange={(v) => setSeeds(s => ({ ...s, [view]: v }))}
-            topics={topics.filter(t => t.type === view)}
+            topics={topics.filter(t => t.type === view && t.status !== 'research')}
             drafts={drafts.filter(d => d.type === view)}
             onGenerate={(count) => generateTopics(view, seeds[view], count)}
             onApproveWrite={writeArticle}
@@ -1305,6 +1355,7 @@ Return ONLY a JSON array (no preamble, no fences):
             onRejectDraft={(id) => updateDraft(id, { status: 'rejected' })}
             onDeleteDraft={deleteDraft}
             canApprove={canApprove}
+            hideGenerator={true}
           />
         )}
 
@@ -1650,6 +1701,14 @@ function Sidebar({ view, setView, counts, currentUser, onLogout, theme, onToggle
       ],
     },
     {
+      label: 'Research',
+      items: [
+        { id: 'research-evergreen', label: 'Evergreen research', icon: Search },
+        { id: 'research-news', label: 'News research', icon: Search },
+        { id: 'research-mythbusting', label: 'Mythbust research', icon: Search },
+      ],
+    },
+    {
       label: 'Pipeline',
       items: [
         { id: 'evergreen', label: 'Evergreen', icon: Sprout, badge: counts.evergreen },
@@ -1794,6 +1853,7 @@ function NewsAutopilotPanel({ canApprove }) {
   const [runningNow, setRunningNow] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState(null);
+  const [progress, setProgress] = useState(null);
 
   const load = async () => {
     setLoading(true);
@@ -1807,7 +1867,32 @@ function NewsAutopilotPanel({ canApprove }) {
     setLoading(false);
   };
 
-  useEffect(() => { load(); }, []);
+  const loadProgress = async () => {
+    try {
+      const res = await fetch('/api/news-autopilot/progress', { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        setProgress(data.progress);
+        return data.progress;
+      }
+    } catch {}
+    return null;
+  };
+
+  useEffect(() => { load(); loadProgress(); }, []);
+
+  // Poll progress while an autopilot run is in flight
+  useEffect(() => {
+    if (!runningNow && !progress?.running) return;
+    const interval = setInterval(async () => {
+      const p = await loadProgress();
+      if (p && !p.running) {
+        // Run finished — reload config to see lastRun stats
+        load();
+      }
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [runningNow, progress?.running]);
 
   const saveConfig = async (patch) => {
     setSaving(true);
@@ -1833,9 +1918,12 @@ function NewsAutopilotPanel({ canApprove }) {
   };
 
   const runNow = async () => {
-    if (!confirm('Run the news autopilot now? This will search the web and create new news topics. May take 30–90 seconds.')) return;
+    if (!confirm('Run the news autopilot now? This will search the web and create new news topics. May take 30–90 seconds per category.')) return;
     setRunningNow(true);
+    setExpanded(true);
     try {
+      // Start polling immediately, before the request completes
+      loadProgress();
       const res = await fetch('/api/news-autopilot/run', {
         method: 'POST', credentials: 'same-origin',
       });
@@ -1843,6 +1931,7 @@ function NewsAutopilotPanel({ canApprove }) {
       if (res.ok) {
         setSaveMsg(`Done: created ${data.totalTopicsCreated || 0} topics`);
         await load();
+        await loadProgress();
       } else {
         setSaveMsg(`Failed: ${data.error || res.status}`);
       }
@@ -1868,7 +1957,6 @@ function NewsAutopilotPanel({ canApprove }) {
     ? Math.floor((Date.now() - config.lastRun.at) / (60 * 60 * 1000))
     : null;
 
-  // Categories user can configure
   const ALL_CATEGORIES = [
     'health_guides', 'women_s_health', 'men_s_health', 'preventive_health',
     'fitness_training', 'diet_nutrition', 'mental_health', 'medications',
@@ -1876,28 +1964,47 @@ function NewsAutopilotPanel({ canApprove }) {
     'health_news', 'tools_calculators',
   ];
 
+  const isRunning = runningNow || progress?.running;
+  const progressPct = progress && progress.totalCategories
+    ? Math.round((progress.completedCategories / progress.totalCategories) * 100)
+    : 0;
+
   return (
-    <div style={{ ...styles.autopilotPanel, ...(config.enabled ? styles.autopilotPanelActive : {}) }}>
+    <div style={{ ...styles.autopilotPanel, ...(config.enabled ? styles.autopilotPanelActive : {}), ...(isRunning ? styles.autopilotPanelRunning : {}) }}>
       <button
         style={styles.autopilotHead}
         onClick={() => setExpanded(e => !e)}
       >
         <div style={styles.autopilotHeadLeft}>
-          <div style={{ ...styles.autopilotStatus, background: config.enabled ? 'var(--c-green)' : 'var(--c-muted)' }} />
-          <div>
+          <div style={{ ...styles.autopilotStatus, background: isRunning ? 'var(--c-ochre)' : (config.enabled ? 'var(--c-green)' : 'var(--c-muted)') }} />
+          <div style={{ flex: 1, minWidth: 0 }}>
             <div style={styles.autopilotTitle}>
               News autopilot <span style={styles.autopilotStatusLabel}>
-                {config.enabled ? '· ON' : '· OFF'}
+                {isRunning ? '· RUNNING' : (config.enabled ? '· ON' : '· OFF')}
               </span>
             </div>
             <div style={styles.autopilotSummary}>
-              {config.enabled
+              {isRunning ? (
+                <>
+                  {progress?.currentStep || 'starting'}
+                  {progress?.currentCategoryLabel && <> — {progress.currentCategoryLabel}</>}
+                  {progress?.totalTopicsCreated > 0 && <> · {progress.totalTopicsCreated} topics created so far</>}
+                </>
+              ) : config.enabled
                 ? `Scheduled: midnight SAST daily · ${enabledCategories.length} categories · up to ${totalPieces} pieces per run`
                 : 'Not scheduled. Expand to configure and turn on.'}
-              {lastRunAgo !== null && lastRunAgo < 48 && (
+              {!isRunning && lastRunAgo !== null && lastRunAgo < 48 && (
                 <> · Last ran {lastRunAgo === 0 ? 'less than an hour' : `${lastRunAgo}h`} ago</>
               )}
             </div>
+            {isRunning && (
+              <div style={styles.autopilotProgressTrack}>
+                <div style={{ ...styles.autopilotProgressFill, width: `${progressPct}%` }} />
+                <span style={styles.autopilotProgressText}>
+                  {progress?.completedCategories || 0} of {progress?.totalCategories || '?'} categories
+                </span>
+              </div>
+            )}
           </div>
         </div>
         <div style={styles.autopilotHeadRight}>
@@ -1907,6 +2014,41 @@ function NewsAutopilotPanel({ canApprove }) {
 
       {expanded && (
         <div style={styles.autopilotBody}>
+          {/* Live progress detail */}
+          {isRunning && (
+            <div style={styles.autopilotLiveProgress}>
+              <div style={styles.autopilotLiveHead}>
+                <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                <span style={styles.autopilotLiveTitle}>Running now</span>
+                <span style={styles.autopilotLivePct}>{progressPct}%</span>
+              </div>
+              <div style={styles.autopilotLiveSteps}>
+                {progress?.currentCategoryLabel && (
+                  <div style={styles.autopilotLiveStep}>
+                    <span style={styles.autopilotLiveLabel}>Current:</span>
+                    <span style={styles.autopilotLiveVal}>{progress.currentCategoryLabel}</span>
+                  </div>
+                )}
+                {progress?.currentStep && (
+                  <div style={styles.autopilotLiveStep}>
+                    <span style={styles.autopilotLiveLabel}>Step:</span>
+                    <span style={styles.autopilotLiveVal}>{progress.currentStep}</span>
+                  </div>
+                )}
+                <div style={styles.autopilotLiveStep}>
+                  <span style={styles.autopilotLiveLabel}>Topics created so far:</span>
+                  <span style={styles.autopilotLiveVal}>{progress?.totalTopicsCreated || 0}</span>
+                </div>
+                {progress?.errors?.length > 0 && (
+                  <div style={{ ...styles.autopilotLiveStep, color: '#A14438' }}>
+                    <span style={styles.autopilotLiveLabel}>Errors:</span>
+                    <span style={styles.autopilotLiveVal}>{progress.errors.length}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Master switch + run now */}
           <div style={styles.autopilotRow}>
             <label style={styles.autopilotCheckLabel}>
@@ -1925,10 +2067,10 @@ function NewsAutopilotPanel({ canApprove }) {
               <button
                 style={styles.secondaryBtn}
                 onClick={runNow}
-                disabled={runningNow}
+                disabled={isRunning}
               >
-                {runningNow ? <Loader2 size={13} /> : <Zap size={13} />}
-                {runningNow ? 'Running…' : 'Run now'}
+                {isRunning ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <Zap size={13} />}
+                {isRunning ? 'Running…' : 'Run now'}
               </button>
             )}
           </div>
@@ -2063,15 +2205,262 @@ function NewsAutopilotPanel({ canApprove }) {
   );
 }
 
+// ============================================================================
+// RESEARCH VIEW — dedicated topic generation with cannibalization check
+// User generates topic ideas, sees uniqueness status, adds to sitemap or discards
+// ============================================================================
+
+function ResearchView({
+  type, seed, onSeedChange, onGenerate,
+  sitePages, drafts, libraryItems, topics,
+  onAddToSitemap, onDiscardResearchTopic, canApprove
+}) {
+  const [count, setCount] = useState(10);
+  const [searchQuery, setSearchQuery] = useState('');
+
+  const TYPE_META = {
+    evergreen: { label: 'Evergreen research', eyebrow: '01 · Research', icon: Sprout,
+      placeholder: 'e.g. menopause, iron deficiency, intermittent fasting, sleep…' },
+    news: { label: 'News research', eyebrow: '02 · Research', icon: Newspaper,
+      placeholder: 'e.g. NHI, mental health SA, HPV vaccine, latest health news…' },
+    mythbusting: { label: 'Mythbust research', eyebrow: '03 · Research', icon: Zap,
+      placeholder: 'e.g. detox teas, gluten myths, apple cider vinegar…' },
+  };
+  const meta = TYPE_META[type];
+
+  // Build the "existing content" set to check cannibalization against
+  const existingItems = [
+    ...sitePages.map(p => ({ ...p, _kind: 'sitemap' })),
+    ...drafts.map(d => ({ ...d, _kind: 'draft' })),
+    ...libraryItems.map(l => ({ ...l, _kind: 'library' })),
+    // Also check against topics already in pipeline (not research)
+    ...topics.filter(t => t.status !== 'research' && t.status !== 'rejected').map(t => ({ ...t, _kind: 'pipeline' })),
+  ];
+
+  // Research topics = topics with status='research' for THIS type
+  const researchTopics = topics.filter(t => t.status === 'research' && t.type === type);
+
+  // Apply search filter
+  const matchesSearch = (item) => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      (item.title || '').toLowerCase().includes(q) ||
+      (item.keyword || '').toLowerCase().includes(q) ||
+      (item.cluster || '').toLowerCase().includes(q) ||
+      (item.category || '').toLowerCase().includes(q) ||
+      (item.angle || '').toLowerCase().includes(q)
+    );
+  };
+  const filteredTopics = researchTopics.filter(matchesSearch);
+
+  // Compute cannibalization for each topic — memoized-ish
+  const topicsWithStatus = filteredTopics.map(t => {
+    if (!t._cannibalCheck) {
+      t._cannibalCheck = checkCannibalization(t.title, t.keyword, existingItems);
+    }
+    return { ...t, _canonCheck: checkCannibalization(t.title, t.keyword, existingItems) };
+  });
+
+  const uniqueCount = topicsWithStatus.filter(t => !t._canonCheck.cannibalized).length;
+  const cannibalCount = topicsWithStatus.filter(t => t._canonCheck.cannibalized).length;
+
+  const countOptions = [1, 2, 3, 4, 5, 10, 20, 30, 40, 50];
+
+  return (
+    <>
+      <PageHead
+        eyebrow={meta.eyebrow}
+        title={meta.label}
+        sub={`Generate ${type} topic ideas with web research. Each idea is checked against your existing sitemap, drafts, and library to spot cannibalization. Add unique ones to the sitemap, discard the rest.`}
+      />
+
+      {/* Seed input + generate */}
+      <div style={styles.researchSeedBlock}>
+        <label style={styles.formLabel}>Topic seed</label>
+        <input
+          value={seed || ''}
+          onChange={e => onSeedChange(e.target.value)}
+          placeholder={meta.placeholder}
+          style={styles.topicInput}
+        />
+
+        <div style={styles.researchCountRow}>
+          <span style={styles.researchCountLabel}>How many ideas?</span>
+          {countOptions.map(n => (
+            <button
+              key={n}
+              onClick={() => setCount(n)}
+              style={{ ...styles.countPill, ...(count === n ? styles.countPillActive : {}) }}
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+
+        <button
+          style={{ ...styles.primaryBtn, marginTop: 12 }}
+          onClick={() => onGenerate(count)}
+          disabled={!canApprove || (!seed?.trim() && type === 'evergreen')}
+        >
+          <Sparkles size={15} /> Generate {count} {type} topics
+        </button>
+      </div>
+
+      {/* Research results */}
+      {researchTopics.length > 0 && (
+        <>
+          {/* Search bar */}
+          <div style={styles.pipelineSearch}>
+            <Search size={14} style={{ color: 'var(--c-muted)' }} />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+              placeholder="Search generated ideas…"
+              style={styles.pipelineSearchInput}
+            />
+            {searchQuery && (
+              <button style={styles.pipelineSearchClear} onClick={() => setSearchQuery('')}>
+                <X size={12} />
+              </button>
+            )}
+          </div>
+
+          {/* Summary strip */}
+          <div style={styles.researchStrip}>
+            <div style={styles.researchStripItem}>
+              <div style={styles.researchStripNum}>{topicsWithStatus.length}</div>
+              <div style={styles.researchStripLabel}>Total ideas</div>
+            </div>
+            <div style={styles.researchStripItem}>
+              <div style={{ ...styles.researchStripNum, color: 'var(--c-green)' }}>{uniqueCount}</div>
+              <div style={styles.researchStripLabel}>Unique</div>
+            </div>
+            <div style={styles.researchStripItem}>
+              <div style={{ ...styles.researchStripNum, color: '#C77D4A' }}>{cannibalCount}</div>
+              <div style={styles.researchStripLabel}>Cannibalized</div>
+            </div>
+          </div>
+
+          {/* Topic cards */}
+          <div style={styles.researchList}>
+            {topicsWithStatus.map(topic => (
+              <ResearchTopicCard
+                key={topic.id}
+                topic={topic}
+                cannibalCheck={topic._canonCheck}
+                onAddToSitemap={() => onAddToSitemap(topic)}
+                onDiscard={() => onDiscardResearchTopic(topic.id)}
+                canApprove={canApprove}
+              />
+            ))}
+          </div>
+        </>
+      )}
+
+      {researchTopics.length === 0 && (
+        <EmptyState
+          icon={meta.icon}
+          title="No research ideas yet"
+          hint={`Enter a seed above and tap Generate to research ${type} ideas.`}
+        />
+      )}
+    </>
+  );
+}
+
+function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, canApprove }) {
+  const [expanded, setExpanded] = useState(false);
+  const isCannibalized = cannibalCheck?.cannibalized;
+  const categoryLabel = CATEGORY_LABELS[topic.category] || topic.category;
+
+  return (
+    <div style={{
+      ...styles.researchCard,
+      ...(isCannibalized ? styles.researchCardCannibal : styles.researchCardUnique),
+    }}>
+      <div style={styles.researchCardMain}>
+        <button style={styles.expandBtn} onClick={() => setExpanded(e => !e)}>
+          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </button>
+
+        {/* Status badge */}
+        {isCannibalized ? (
+          <div style={styles.researchStatusCannibal} title={`Similar to: ${cannibalCheck.matchTitle}`}>
+            <AlertCircle size={12} />
+            <span>Cannibalized {cannibalCheck.score}%</span>
+          </div>
+        ) : (
+          <div style={styles.researchStatusUnique}>
+            <Check size={12} />
+            <span>Unique</span>
+          </div>
+        )}
+
+        <div style={styles.researchCardBody}>
+          <div style={styles.researchCardTitle}>{topic.title}</div>
+          <div style={styles.researchCardMeta}>
+            {categoryLabel && <span style={styles.cardCategory}>{categoryLabel}</span>}
+            {topic.cluster && <><span style={styles.cardDot}>·</span><span>{topic.cluster}</span></>}
+            {topic.keyword && <><span style={styles.cardDot}>·</span><span style={styles.kwTag}>{topic.keyword}</span></>}
+          </div>
+          {isCannibalized && (
+            <div style={styles.researchCannibalNote}>
+              Similar to existing {cannibalCheck.matchKind}: <em>"{cannibalCheck.matchTitle}"</em>
+            </div>
+          )}
+        </div>
+
+        {canApprove && (
+          <div style={styles.researchCardActions}>
+            <button
+              style={styles.researchDiscardBtn}
+              onClick={onDiscard}
+              title="Discard this idea"
+            >
+              <Trash2 size={13} />
+            </button>
+            <button
+              style={{
+                ...styles.researchAddBtn,
+                ...(isCannibalized ? styles.researchAddBtnMuted : {}),
+              }}
+              onClick={onAddToSitemap}
+              title={isCannibalized ? 'Add anyway (risk of cannibalization)' : 'Add to sitemap + pipeline'}
+            >
+              <Plus size={13} />
+              <span>Add to sitemap</span>
+            </button>
+          </div>
+        )}
+      </div>
+
+      {expanded && (
+        <div style={styles.researchCardDetails}>
+          {topic.angle && <div style={styles.researchDetailRow}><strong>Angle:</strong> {topic.angle}</div>}
+          {topic.whyEvergreen && <div style={styles.researchDetailRow}><strong>Why evergreen:</strong> {topic.whyEvergreen}</div>}
+          {topic.whyNow && <div style={styles.researchDetailRow}><strong>Why now:</strong> {topic.whyNow}</div>}
+          {topic.theMyth && <div style={styles.researchDetailRow}><strong>The myth:</strong> {topic.theMyth}</div>}
+          {topic.theTruth && <div style={styles.researchDetailRow}><strong>The truth:</strong> {topic.theTruth}</div>}
+          {topic.effort && <div style={styles.researchDetailRow}><strong>Effort:</strong> {topic.effort}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PipelineView({
   type, seed, onSeedChange, topics, drafts,
   onGenerate, onApproveWrite, onRetryFailed, onRetryAllStuck, queueState,
   onRejectTopic, onReinstateTopic, onDeleteTopic,
-  onOpenDraft, onPublishDraft, onRejectDraft, onDeleteDraft, canApprove
+  onOpenDraft, onPublishDraft, onRejectDraft, onDeleteDraft, canApprove,
+  hideGenerator = false,
 }) {
   const [count, setCount] = useState(50);
   const [tab, setTab] = useState('topics');
   const [filter, setFilter] = useState('pending');
+  const [searchQuery, setSearchQuery] = useState('');
 
   const META = {
     evergreen: {
@@ -2098,9 +2487,21 @@ function PipelineView({
   };
   const meta = META[type] || META.evergreen;
 
+  const matchesSearch = (item) => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      (item.title || '').toLowerCase().includes(q) ||
+      (item.keyword || '').toLowerCase().includes(q) ||
+      (item.cluster || '').toLowerCase().includes(q) ||
+      (item.category || '').toLowerCase().includes(q) ||
+      (item.angle || '').toLowerCase().includes(q)
+    );
+  };
+
   const filteredTopics = topics.filter(t => {
-    if (filter === 'all') return true;
-    return t.status === filter;
+    if (filter !== 'all' && t.status !== filter) return false;
+    return matchesSearch(t);
   });
 
   const draftFilters = [
@@ -2127,41 +2528,75 @@ function PipelineView({
         </div>
       </div>
 
-      {/* TOPIC INPUT BAR */}
-      <div style={styles.topicBar}>
-        <div style={styles.topicBarRow}>
-          <div style={styles.topicInputWrap}>
-            <label style={styles.topicInputLabel}>Topic seed</label>
-            <input
-              value={seed}
-              onChange={e => onSeedChange(e.target.value)}
-              placeholder={meta.placeholder}
-              style={styles.topicInput}
-              onKeyDown={e => { if (e.key === 'Enter') onGenerate(count); }}
-            />
-          </div>
-          <div style={styles.countWrap}>
-            <label style={styles.topicInputLabel}>Topics <span style={styles.countBadgeInline}>{count}</span></label>
-            <div style={styles.countPillRow}>
-              {[1, 2, 3, 4, 5, 10, 20, 30, 40, 50].map(n => (
-                <button
-                  key={n}
-                  onClick={() => setCount(n)}
-                  style={{ ...styles.countPill, ...(count === n ? styles.countPillActive : {}) }}
-                >
-                  {n}
-                </button>
-              ))}
+      {/* TOPIC INPUT BAR — hidden when generation moved to Research view */}
+      {!hideGenerator && (
+        <div style={styles.topicBar}>
+          <div style={styles.topicBarRow}>
+            <div style={styles.topicInputWrap}>
+              <label style={styles.topicInputLabel}>Topic seed</label>
+              <input
+                value={seed}
+                onChange={e => onSeedChange(e.target.value)}
+                placeholder={meta.placeholder}
+                style={styles.topicInput}
+                onKeyDown={e => { if (e.key === 'Enter') onGenerate(count); }}
+              />
             </div>
+            <div style={styles.countWrap}>
+              <label style={styles.topicInputLabel}>Topics <span style={styles.countBadgeInline}>{count}</span></label>
+              <div style={styles.countPillRow}>
+                {[1, 2, 3, 4, 5, 10, 20, 30, 40, 50].map(n => (
+                  <button
+                    key={n}
+                    onClick={() => setCount(n)}
+                    style={{ ...styles.countPill, ...(count === n ? styles.countPillActive : {}) }}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <button style={{ ...styles.primaryBtn, alignSelf: 'flex-end' }} onClick={() => onGenerate(count)}>
+              <Sparkles size={15} /> Generate
+            </button>
           </div>
-          <button style={{ ...styles.primaryBtn, alignSelf: 'flex-end' }} onClick={() => onGenerate(count)}>
-            <Sparkles size={15} /> Generate
-          </button>
         </div>
-      </div>
+      )}
+      {hideGenerator && (
+        <div style={styles.pipelineHint}>
+          <Search size={13} style={{ color: 'var(--c-muted)' }} />
+          <span>To research new {type} ideas, use the <strong>{type === 'mythbusting' ? 'Mythbust' : type.charAt(0).toUpperCase() + type.slice(1)} research</strong> page in the Research section.</span>
+        </div>
+      )}
 
       {/* News Autopilot panel (only visible on news view) */}
       {type === 'news' && <NewsAutopilotPanel canApprove={canApprove} />}
+
+      {/* Search bar */}
+      <div style={styles.pipelineSearch}>
+        <Search size={14} style={{ color: 'var(--c-muted)' }} />
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          placeholder={`Search ${type} topics and drafts by title, keyword, cluster, or category…`}
+          style={styles.pipelineSearchInput}
+        />
+        {searchQuery && (
+          <button
+            style={styles.pipelineSearchClear}
+            onClick={() => setSearchQuery('')}
+            title="Clear search"
+          >
+            <X size={12} />
+          </button>
+        )}
+        {searchQuery && (
+          <span style={styles.pipelineSearchCount}>
+            {filteredTopics.length} {filteredTopics.length === 1 ? 'topic' : 'topics'} matched
+          </span>
+        )}
+      </div>
 
       {/* SUB-TABS */}
       <div style={styles.subTabRow}>
@@ -2191,6 +2626,7 @@ function PipelineView({
             <WriteQueueBanner
               queueState={queueState}
               failedCount={topicCounts.failed}
+              writtenCount={topicCounts.written}
               onRetryAll={onRetryAllStuck}
             />
           )}
@@ -2222,10 +2658,16 @@ function PipelineView({
           {filteredTopics.length === 0 ? (
             <EmptyState
               icon={meta.icon}
-              title={topics.length === 0 ? `No ${type} topics yet` : `Nothing in "${filter}"`}
-              hint={topics.length === 0
-                ? `Enter a seed above and tap Generate to pitch ${type} ideas.`
-                : 'Switch filters or generate more topics.'}
+              title={
+                searchQuery ? `No ${type} topics matching "${searchQuery}"` :
+                topics.length === 0 ? `No ${type} topics yet` :
+                `Nothing in "${filter}"`
+              }
+              hint={
+                searchQuery ? 'Try a different search term or clear search to see all.' :
+                topics.length === 0 ? `Enter a seed above and tap Generate to pitch ${type} ideas.` :
+                'Switch filters or generate more topics.'
+              }
             />
           ) : (
             <CategoryAccordion
@@ -2263,29 +2705,34 @@ function PipelineView({
             ))}
           </div>
 
-          {drafts.filter(d => filter === 'all' || d.status === filter).length === 0 ? (
-            <EmptyState
-              icon={FileText}
-              title="No drafts to review"
-              hint="Approve a topic to send it to the writer. Drafts land here when ready."
-            />
-          ) : (
-            <CategoryAccordion
-              items={drafts.filter(d => filter === 'all' || d.status === filter)}
-              storageKey={`acc-drafts-${type}`}
-              renderRow={(d) => (
-                <DraftRow
-                  key={d.id}
-                  draft={d}
-                  onView={() => onOpenDraft(d)}
-                  onPublish={() => onPublishDraft(d)}
-                  onReject={() => onRejectDraft(d.id)}
-                  onDelete={() => onDeleteDraft(d.id)}
-                  canApprove={canApprove}
-                />
-              )}
-            />
-          )}
+          {(() => {
+            const filteredDrafts = drafts
+              .filter(d => filter === 'all' || d.status === filter)
+              .filter(matchesSearch);
+            return filteredDrafts.length === 0 ? (
+              <EmptyState
+                icon={FileText}
+                title={searchQuery ? `No drafts matching "${searchQuery}"` : 'No drafts to review'}
+                hint={searchQuery ? 'Try a different search term.' : 'Approve a topic to send it to the writer. Drafts land here when ready.'}
+              />
+            ) : (
+              <CategoryAccordion
+                items={filteredDrafts}
+                storageKey={`acc-drafts-${type}`}
+                renderRow={(d) => (
+                  <DraftRow
+                    key={d.id}
+                    draft={d}
+                    onView={() => onOpenDraft(d)}
+                    onPublish={() => onPublishDraft(d)}
+                    onReject={() => onRejectDraft(d.id)}
+                    onDelete={() => onDeleteDraft(d.id)}
+                    canApprove={canApprove}
+                  />
+                )}
+              />
+            );
+          })()}
         </>
       )}
     </>
@@ -2392,21 +2839,24 @@ function CategoryAccordion({ items, renderRow, storageKey }) {
 // WRITE QUEUE BANNER — shows in-flight + queued counts, retry-all button
 // ============================================================================
 
-function WriteQueueBanner({ queueState, failedCount, onRetryAll }) {
+function WriteQueueBanner({ queueState, failedCount, onRetryAll, writtenCount = 0 }) {
   const { waiting, inFlight } = queueState;
   const active = inFlight > 0 || waiting > 0;
+  const totalInPlay = waiting + inFlight + writtenCount;
+  const overallPct = totalInPlay > 0 ? Math.round((writtenCount / totalInPlay) * 100) : 0;
+
   return (
     <div style={{ ...styles.queueBanner, ...(failedCount > 0 ? styles.queueBannerWarn : {}) }}>
       <div style={styles.queueBannerLeft}>
         {active && (
           <span style={styles.queueBannerSpinner}>
-            <Loader2 size={14} className="claude-spin" />
+            <Loader2 size={14} className="claude-spin" style={{ animation: 'spin 1s linear infinite' }} />
           </span>
         )}
-        <div>
+        <div style={{ flex: 1, minWidth: 0 }}>
           {active && (
             <div style={styles.queueBannerTitle}>
-              Writing in progress · {inFlight} active{waiting > 0 ? `, ${waiting} queued` : ''}
+              Writing in progress · {inFlight} active{waiting > 0 ? `, ${waiting} queued` : ''}{writtenCount > 0 ? `, ${writtenCount} done` : ''}
             </div>
           )}
           {!active && failedCount > 0 && (
@@ -2418,6 +2868,14 @@ function WriteQueueBanner({ queueState, failedCount, onRetryAll }) {
             {active && 'Articles are being written server-side. You can safely close the tab — writes continue in the background.'}
             {!active && failedCount > 0 && 'Tap retry to requeue — the server worker will pick them up on its next run.'}
           </div>
+          {active && totalInPlay > 0 && (
+            <div style={styles.queueBannerProgressWrap}>
+              <div style={styles.queueBannerProgress}>
+                <div style={{ ...styles.queueBannerProgressFill, width: `${overallPct}%` }} />
+              </div>
+              <span style={styles.queueBannerProgressText}>{overallPct}% ({writtenCount}/{totalInPlay})</span>
+            </div>
+          )}
         </div>
       </div>
       {failedCount > 0 && (
@@ -2435,6 +2893,15 @@ function WriteQueueBanner({ queueState, failedCount, onRetryAll }) {
 
 function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate, onDelete, canApprove = true }) {
   const [expanded, setExpanded] = useState(false);
+  const [, forceTick] = useState(0);
+  const isWriting = topic.status === 'writing';
+
+  // While writing, tick every second so elapsed time + progress bar update
+  useEffect(() => {
+    if (!isWriting) return;
+    const interval = setInterval(() => forceTick(t => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, [isWriting]);
 
   const statusColor = {
     pending: '#C77D4A',
@@ -2447,11 +2914,14 @@ function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate,
 
   const categoryLabel = CATEGORY_LABELS[topic.category] || topic.category;
 
-  const isWriting = topic.status === 'writing';
-
-  // Time elapsed while writing
+  // Time elapsed while writing + estimated progress
   const writingElapsed = isWriting && topic.writingStartedAt
     ? Math.floor((Date.now() - topic.writingStartedAt) / 1000)
+    : 0;
+  // Estimated write time is 90s. Show progress up to 95% max until actually done.
+  const ESTIMATED_WRITE_SECONDS = 90;
+  const writingProgress = isWriting
+    ? Math.min(95, Math.round((writingElapsed / ESTIMATED_WRITE_SECONDS) * 100))
     : 0;
 
   return (
@@ -2496,9 +2966,15 @@ function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate,
             </span>
           )}
           {isWriting && (
-            <div style={styles.writingChip} title={`Writing for ${writingElapsed}s`}>
-              <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
-              writing {writingElapsed > 0 && <span style={styles.writingElapsed}>{writingElapsed}s</span>}
+            <div style={styles.writingProgress}>
+              <div style={styles.writingChipInline}>
+                <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
+                <span style={styles.writingChipLabel}>writing</span>
+                <span style={styles.writingElapsed}>{writingElapsed}s</span>
+              </div>
+              <div style={styles.writingBar}>
+                <div style={{ ...styles.writingBarFill, width: `${writingProgress}%` }} />
+              </div>
             </div>
           )}
           {topic.status === 'written' && (
@@ -2633,11 +3109,24 @@ function DraftRow({ draft, onView, onPublish, onReject, onDelete, canApprove = t
 function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, onPushToWP, wpStatus, canApprove = true, showToast }) {
   const [filter, setFilter] = useState('all');
   const [deployFilter, setDeployFilter] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const matchesSearch = (item) => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      (item.title || '').toLowerCase().includes(q) ||
+      (item.keyword || '').toLowerCase().includes(q) ||
+      (item.cluster || '').toLowerCase().includes(q) ||
+      (item.category || '').toLowerCase().includes(q) ||
+      (item.excerpt || '').toLowerCase().includes(q) ||
+      (item.tags || []).some(t => (t || '').toLowerCase().includes(q))
+    );
+  };
   const filtered = items.filter(i => {
     if (filter !== 'all' && i.type !== filter) return false;
     if (deployFilter === 'deployed' && !i.deployed) return false;
     if (deployFilter === 'pending' && i.deployed) return false;
-    return true;
+    return matchesSearch(i);
   });
 
   const filters = [
@@ -2669,6 +3158,29 @@ function LibraryView({ items, onView, onExport, onDelete, onToggleDeployed, onPu
     <>
       <PageHead eyebrow="04" title="Library" sub={`${items.length} finished ${items.length === 1 ? 'article' : 'articles'}.`} />
       <WpStatusBanner status={wpStatus} />
+
+      {/* Search bar */}
+      <div style={styles.pipelineSearch}>
+        <Search size={14} style={{ color: 'var(--c-muted)' }} />
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          placeholder="Search library by title, keyword, category, cluster, excerpt, or tag…"
+          style={styles.pipelineSearchInput}
+        />
+        {searchQuery && (
+          <button style={styles.pipelineSearchClear} onClick={() => setSearchQuery('')}>
+            <X size={12} />
+          </button>
+        )}
+        {searchQuery && (
+          <span style={styles.pipelineSearchCount}>
+            {filtered.length} match
+          </span>
+        )}
+      </div>
+
       <div style={styles.filterRow}>
         {filters.map(f => (
           <button
@@ -3000,12 +3512,26 @@ function Modal({ children, onClose }) {
   );
 }
 
-function LoadingPanel({ message }) {
+function LoadingPanel({ message, estimatedSeconds = 90 }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  // Fill smoothly, cap at 95% until real completion
+  const pct = Math.min(95, Math.round((elapsed / estimatedSeconds) * 100));
   return (
     <div style={styles.loadingPanel}>
-      <Loader2 size={32} style={{ animation: 'spin 1.2s linear infinite', color: '#2D5F4E' }} />
+      <Loader2 size={26} style={{ animation: 'spin 1.2s linear infinite', color: '#2D5F4E' }} />
       <p style={styles.loadingMsg}>{message}</p>
-      <p style={styles.loadingSub}>This can take 30–120 seconds with web search.</p>
+      <div style={styles.loadingProgressTrack}>
+        <div style={{ ...styles.loadingProgressFill, width: `${pct}%` }} />
+      </div>
+      <div style={styles.loadingProgressMeta}>
+        <span style={styles.loadingProgressPct}>{pct}%</span>
+        <span style={styles.loadingProgressElapsed}>{elapsed}s elapsed</span>
+      </div>
+      <p style={styles.loadingSub}>Web search + generation in progress</p>
     </div>
   );
 }
@@ -4157,7 +4683,7 @@ function DatabaseView({ showToast }) {
   useEffect(() => { loadSnapshot(); }, []);
 
   const doClear = async (key, label) => {
-    if (!confirm(`Clear "${label}"? This cannot be undone. Snapshot: ${snapshot[key]?.count || 0} items.`)) return;
+    if (!confirm(`Clear "${label}"? This cannot be undone. Snapshot: ${snapshot[key]?.count || 0} items.\n\nPage will reload after clearing.`)) return;
     setBusy(key);
     try {
       let res;
@@ -4173,24 +4699,35 @@ function DatabaseView({ showToast }) {
         });
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      showToast(`Cleared ${label}`, 'success');
-      await loadSnapshot();
+      showToast(`Cleared ${label} — reloading…`, 'success');
+      // Force full reload so all other views see the cleared data
+      setTimeout(() => window.location.reload(), 800);
     } catch (e) {
       showToast(`Failed to clear ${label}: ${e.message}`, 'error');
-    } finally {
       setBusy(null);
     }
   };
 
-  // Clear topics/drafts/library filtered by content type
+  // Clear topics/drafts/library/sitemap items filtered by content type
   const doClearByType = async (contentType) => {
-    if (!confirm(`Clear all ${contentType} topics, drafts, and library items? News and mythbust untouched.`)) return;
+    if (!confirm(`Clear ALL ${contentType} content?\n\n• All ${contentType} topics (research + pipeline)\n• All ${contentType} drafts\n• All ${contentType} library items\n• All sitemap pages added from ${contentType} research\n\nOther content types untouched. Page will reload after clearing.`)) return;
     setBusy(`type:${contentType}`);
     try {
+      let removed = { topics: 0, drafts: 0, library: 0, sitePages: 0 };
+
+      // Get current topics to identify sitemap pages linked to them
+      const topicsRes = await fetch('/api/data/topics', { credentials: 'same-origin' });
+      const topicsData = await topicsRes.json();
+      const allTopics = topicsData.value || [];
+      const typeTopicIds = new Set(allTopics.filter(t => t.type === contentType).map(t => t.id));
+
+      // Clear topics, drafts, library
       for (const key of ['topics', 'drafts', 'library']) {
         const res = await fetch('/api/data/' + key, { credentials: 'same-origin' });
         const data = await res.json();
+        const before = (data.value || []).length;
         const filtered = (data.value || []).filter(x => x.type !== contentType);
+        removed[key] = before - filtered.length;
         await fetch('/api/data/' + key, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -4198,11 +4735,33 @@ function DatabaseView({ showToast }) {
           body: JSON.stringify({ value: filtered }),
         });
       }
-      showToast(`Cleared all ${contentType} content`, 'success');
-      await loadSnapshot();
+
+      // Clear sitePages that came from research of this type
+      const spRes = await fetch('/api/data/sitePages', { credentials: 'same-origin' });
+      const spData = await spRes.json();
+      const spBefore = (spData.value || []).length;
+      const spFiltered = (spData.value || []).filter(p => {
+        // Explicit type match (set on new sitemap items)
+        if (p.type === contentType) return false;
+        // Or linked via sourceTopicId to a topic of this type
+        if (p.sourceTopicId && typeTopicIds.has(p.sourceTopicId)) return false;
+        return true;
+      });
+      removed.sitePages = spBefore - spFiltered.length;
+      await fetch('/api/data/sitePages', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ value: spFiltered }),
+      });
+
+      showToast(
+        `Cleared ${contentType}: ${removed.topics} topics, ${removed.drafts} drafts, ${removed.library} library, ${removed.sitePages} sitemap — reloading…`,
+        'success'
+      );
+      setTimeout(() => window.location.reload(), 1500);
     } catch (e) {
       showToast(`Failed: ${e.message}`, 'error');
-    } finally {
       setBusy(null);
     }
   };
@@ -4261,27 +4820,6 @@ function DatabaseView({ showToast }) {
     }
   };
 
-  // Trigger the queue worker manually
-  const runWorker = async () => {
-    setBusy('worker');
-    try {
-      const res = await fetch('/api/queue/process', { method: 'POST', credentials: 'same-origin' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      const processed = data.processed || 0;
-      if (data.skipped) {
-        showToast(`Worker skipped: ${data.reason}`, 'success');
-      } else {
-        showToast(`Worker ran: processed ${processed} ${processed === 1 ? 'topic' : 'topics'}`, 'success');
-      }
-      await loadSnapshot();
-    } catch (e) {
-      showToast(`Worker failed: ${e.message}`, 'error');
-    } finally {
-      setBusy(null);
-    }
-  };
-
   const fmtBytes = (n) => n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 
   // Config
@@ -4309,16 +4847,6 @@ function DatabaseView({ showToast }) {
           </button>
         }
       />
-
-      {/* Server worker controls */}
-      <section style={styles.dbSection}>
-        <h2 style={styles.dbSectionTitle}>Write queue worker</h2>
-        <p style={styles.dbSectionSub}>Runs every minute via Vercel Cron. Tap to run immediately.</p>
-        <button style={styles.primaryBtn} onClick={runWorker} disabled={busy === 'worker'}>
-          {busy === 'worker' ? <Loader2 size={13} /> : <Zap size={13} />}
-          {busy === 'worker' ? 'Running worker…' : 'Run worker now'}
-        </button>
-      </section>
 
       {/* Snapshot */}
       <section style={styles.dbSection}>
@@ -5218,13 +5746,12 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
                 : 'ready';
     clusters[c][bucket].push({ ...item, kind, _status: status });
   };
-  // sitePages have no type — always include
+  // sitePages have no type — always include (these ARE the sitemap)
   sitePages.forEach(p => addToCluster(p, 'LIVE', 'page'));
-  topics.filter(t => ['pending', 'writing', 'written'].includes(t.status) && (typeFilter === 'all' || t.type === typeFilter)).forEach(t => {
-    addToCluster(t, t.status === 'writing' ? 'WRITING' : 'PLANNED', 'topic');
-  });
+  // Drafts and library items show as writing progress
   drafts.filter(d => typeFilter === 'all' || d.type === typeFilter).forEach(d => addToCluster(d, 'DRAFT', 'draft'));
   libraryItems.filter(l => typeFilter === 'all' || l.type === typeFilter).forEach(l => addToCluster(l, l.deployed ? 'DEPLOYED' : 'READY', 'library'));
+  // Topics deliberately excluded — they live in the pipeline pages, not the sitemap
 
   // Sort clusters: most items first, "Unclustered" last
   const clusterEntries = Object.entries(clusters).sort((a, b) => {
@@ -5256,7 +5783,7 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
       <PageHead
         eyebrow="00 · Topical authority"
         title="Sitemap"
-        sub="Plan the ideal evergreen sitemap, then work the editor toward it. Colour shifts as each topic moves through generation, drafting, and deployment."
+        sub="Your site's information architecture — live pages, published articles, and drafts in progress. Topic ideas live in the pipeline tabs (Evergreen, News, Mythbust)."
         action={
           <div style={{ display: 'flex', gap: 8 }}>
             <button style={styles.secondaryBtn} onClick={onBulkAdd}>
@@ -6007,6 +6534,54 @@ const fonts = {
   body: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif",
 };
 
+// ============================================================================
+// CANNIBALIZATION CHECK — detects overlap between a new topic and existing content
+// Uses Jaccard word overlap on title + keyword. Returns match info if score >= 0.45
+// ============================================================================
+function normalizeWords(str) {
+  return (str || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOPWORDS.has(w));
+}
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'you', 'your', 'with', 'from', 'this', 'that', 'have',
+  'has', 'are', 'was', 'were', 'been', 'being', 'when', 'what', 'how', 'why',
+  'who', 'which', 'their', 'they', 'them', 'not', 'but', 'can', 'will', 'would',
+  'should', 'could', 'about', 'more', 'into', 'than', 'then', 'over', 'under',
+  'guide', 'guides', 'article', 'articles', 'best', 'top', 'ways', 'things',
+]);
+function checkCannibalization(newTitle, newKeyword, existingItems) {
+  const newWordArr = [...normalizeWords(newTitle), ...normalizeWords(newKeyword)];
+  const newWords = new Set(newWordArr);
+  if (newWords.size < 2) return { cannibalized: false };
+
+  let best = null;
+  let bestScore = 0;
+  for (const item of existingItems) {
+    const itemWords = new Set([...normalizeWords(item.title), ...normalizeWords(item.keyword)]);
+    if (itemWords.size < 2) continue;
+    let overlap = 0;
+    for (const w of newWords) if (itemWords.has(w)) overlap++;
+    const union = newWords.size + itemWords.size - overlap;
+    const score = union > 0 ? overlap / union : 0;
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  if (bestScore >= 0.45) {
+    return {
+      cannibalized: true,
+      matchTitle: best.title,
+      matchKind: best._kind || 'existing',
+      score: Math.round(bestScore * 100),
+    };
+  }
+  return { cannibalized: false };
+}
+
 const CATEGORY_LABELS = {
   fitness: 'Fitness',
   nutrition: 'Nutrition',
@@ -6219,6 +6794,232 @@ const styles = {
   targetGroup: { display: 'inline-flex', alignItems: 'center', gap: 4, background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '2px 2px 2px 4px' },
   targetTypeBadge: { fontSize: 9.5, fontWeight: 700, padding: '2px 5px', borderRadius: 3, letterSpacing: '0.05em', lineHeight: 1 },
   targetSelect: { padding: '3px 4px 3px 6px', fontSize: 12.5, border: 'none', background: 'transparent', fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600, cursor: 'pointer', outline: 'none' },
+
+  // === LOADING PROGRESS BAR ===
+  loadingProgressTrack: {
+    width: '85%', maxWidth: 320, height: 5,
+    background: colors.borderSoft, borderRadius: 3,
+    overflow: 'hidden', marginTop: 8,
+  },
+  loadingProgressFill: {
+    height: '100%', background: '#2D5F4E',
+    borderRadius: 3, transition: 'width 0.6s ease-out',
+  },
+  loadingProgressMeta: {
+    display: 'flex', gap: 12, alignItems: 'center', marginTop: 6,
+    fontFamily: 'ui-monospace, monospace', fontSize: 11,
+  },
+  loadingProgressPct: { color: '#2D5F4E', fontWeight: 700 },
+  loadingProgressElapsed: { color: colors.muted },
+
+  // === PIPELINE HINT ===
+  pipelineHint: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    padding: '10px 14px', marginBottom: 12,
+    background: colors.bg, border: `1px dashed ${colors.borderSoft}`,
+    borderRadius: 5, fontSize: 12, color: colors.muted,
+    fontStyle: 'italic',
+  },
+
+  // === RESEARCH VIEW ===
+  researchSeedBlock: {
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 8, padding: 16, marginBottom: 16,
+  },
+  researchCountRow: {
+    display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginTop: 12,
+  },
+  researchCountLabel: {
+    fontSize: 11.5, fontWeight: 600, color: colors.muted,
+    marginRight: 8, textTransform: 'uppercase', letterSpacing: '0.05em',
+  },
+  researchStrip: {
+    display: 'flex', gap: 12, marginBottom: 14,
+  },
+  researchStripItem: {
+    flex: 1, textAlign: 'center', padding: '10px 14px',
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 6,
+  },
+  researchStripNum: {
+    fontSize: 24, fontWeight: 700, color: colors.ink,
+    fontFamily: 'ui-monospace, monospace',
+  },
+  researchStripLabel: {
+    fontSize: 10.5, fontWeight: 600, color: colors.muted,
+    letterSpacing: '0.06em', textTransform: 'uppercase', marginTop: 2,
+  },
+  researchList: {
+    display: 'flex', flexDirection: 'column', gap: 8,
+  },
+  researchCard: {
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 6, overflow: 'hidden',
+  },
+  researchCardUnique: { borderLeftWidth: 3, borderLeftColor: colors.green },
+  researchCardCannibal: { borderLeftWidth: 3, borderLeftColor: '#C77D4A' },
+  researchCardMain: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '12px 16px',
+  },
+  researchStatusUnique: {
+    display: 'inline-flex', alignItems: 'center', gap: 4,
+    padding: '4px 8px', background: 'rgba(45, 95, 78, 0.1)',
+    color: colors.green, fontSize: 10.5, fontWeight: 700,
+    borderRadius: 4, flexShrink: 0,
+    textTransform: 'uppercase', letterSpacing: '0.05em',
+  },
+  researchStatusCannibal: {
+    display: 'inline-flex', alignItems: 'center', gap: 4,
+    padding: '4px 8px', background: 'rgba(199, 125, 74, 0.15)',
+    color: '#C77D4A', fontSize: 10.5, fontWeight: 700,
+    borderRadius: 4, flexShrink: 0,
+    textTransform: 'uppercase', letterSpacing: '0.05em',
+  },
+  researchCardBody: { flex: 1, minWidth: 0 },
+  researchCardTitle: {
+    fontSize: 13.5, fontWeight: 600, color: colors.ink,
+    letterSpacing: '-0.005em', marginBottom: 3,
+  },
+  researchCardMeta: {
+    fontSize: 11, color: colors.muted, display: 'flex',
+    gap: 6, alignItems: 'center', flexWrap: 'wrap',
+  },
+  researchCannibalNote: {
+    fontSize: 11, color: '#C77D4A', marginTop: 4, lineHeight: 1.4,
+  },
+  researchCardActions: {
+    display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0,
+  },
+  researchDiscardBtn: {
+    display: 'inline-flex', alignItems: 'center', gap: 5,
+    padding: '7px 10px', fontSize: 11.5, fontWeight: 600,
+    background: colors.bg, color: colors.muted,
+    border: `1px solid ${colors.border}`, borderRadius: 4,
+    fontFamily: fonts.body, cursor: 'pointer',
+  },
+  researchAddBtn: {
+    display: 'inline-flex', alignItems: 'center', gap: 5,
+    padding: '7px 12px', fontSize: 11.5, fontWeight: 600,
+    background: colors.green, color: '#FFFFFF',
+    border: 'none', borderRadius: 4,
+    fontFamily: fonts.body, cursor: 'pointer',
+  },
+  researchAddBtnMuted: {
+    background: 'rgba(199, 125, 74, 0.15)', color: '#C77D4A',
+    border: '1px solid rgba(199, 125, 74, 0.4)',
+  },
+  researchCardDetails: {
+    padding: '10px 16px 14px', background: colors.bg,
+    borderTop: `1px solid ${colors.borderSoft}`,
+  },
+  researchDetailRow: {
+    fontSize: 12.5, color: colors.ink, marginBottom: 6, lineHeight: 1.4,
+  },
+
+  // === PIPELINE SEARCH ===
+  pipelineSearch: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '10px 14px', background: colors.surface,
+    border: `1px solid ${colors.border}`, borderRadius: 6,
+    marginBottom: 14,
+  },
+  pipelineSearchInput: {
+    flex: 1, background: 'transparent', border: 'none', outline: 'none',
+    fontFamily: fonts.body, fontSize: 13.5, color: colors.ink,
+    padding: 0,
+  },
+  pipelineSearchClear: {
+    background: 'transparent', border: 'none', color: colors.muted,
+    padding: 4, cursor: 'pointer', display: 'inline-flex', alignItems: 'center',
+    borderRadius: 3,
+  },
+  pipelineSearchCount: {
+    fontSize: 11, fontWeight: 600, color: colors.muted,
+    fontFamily: 'ui-monospace, monospace', whiteSpace: 'nowrap',
+    padding: '3px 8px', background: colors.bg,
+    borderRadius: 3, letterSpacing: '0.02em',
+  },
+
+  // === WRITE PROGRESS BARS ===
+  writingProgress: {
+    display: 'flex', flexDirection: 'column', gap: 4,
+    minWidth: 160,
+  },
+  writingChipInline: {
+    display: 'inline-flex', alignItems: 'center', gap: 6,
+    fontSize: 11, color: '#3A5266', fontWeight: 600,
+    padding: '4px 8px', background: 'rgba(58, 82, 102, 0.1)',
+    borderRadius: 4, whiteSpace: 'nowrap',
+  },
+  writingChipLabel: { letterSpacing: '0.02em' },
+  writingBar: {
+    width: '100%', height: 3, background: colors.borderSoft,
+    borderRadius: 2, overflow: 'hidden',
+  },
+  writingBarFill: {
+    height: '100%', background: '#3A5266',
+    borderRadius: 2, transition: 'width 0.6s ease-out',
+  },
+
+  queueBannerProgressWrap: {
+    display: 'flex', alignItems: 'center', gap: 10, marginTop: 8,
+  },
+  queueBannerProgress: {
+    flex: 1, height: 4, background: colors.borderSoft,
+    borderRadius: 2, overflow: 'hidden',
+  },
+  queueBannerProgressFill: {
+    height: '100%', background: colors.green,
+    borderRadius: 2, transition: 'width 0.6s ease-out',
+  },
+  queueBannerProgressText: {
+    fontSize: 11, fontWeight: 600, color: colors.muted,
+    fontFamily: 'ui-monospace, monospace', whiteSpace: 'nowrap',
+  },
+
+  autopilotPanelRunning: {
+    borderColor: '#C77D4A',
+    borderLeftWidth: 3,
+    background: 'rgba(199, 125, 74, 0.03)',
+  },
+  autopilotProgressTrack: {
+    position: 'relative',
+    height: 4, background: colors.borderSoft,
+    borderRadius: 2, overflow: 'hidden',
+    marginTop: 6, maxWidth: 380,
+  },
+  autopilotProgressFill: {
+    height: '100%', background: '#C77D4A',
+    borderRadius: 2, transition: 'width 0.6s ease-out',
+  },
+  autopilotProgressText: {
+    position: 'absolute', top: 6, left: 0,
+    fontSize: 10.5, color: colors.muted, fontFamily: 'ui-monospace, monospace',
+  },
+  autopilotLiveProgress: {
+    padding: 12,
+    background: 'rgba(199, 125, 74, 0.06)',
+    border: '1px solid rgba(199, 125, 74, 0.3)',
+    borderRadius: 6, marginBottom: 12,
+  },
+  autopilotLiveHead: {
+    display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8,
+  },
+  autopilotLiveTitle: { fontSize: 12.5, fontWeight: 600, color: '#C77D4A', flex: 1 },
+  autopilotLivePct: {
+    fontSize: 12, fontWeight: 700, color: '#C77D4A',
+    fontFamily: 'ui-monospace, monospace',
+  },
+  autopilotLiveSteps: {
+    display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11.5,
+  },
+  autopilotLiveStep: { display: 'flex', gap: 8 },
+  autopilotLiveLabel: {
+    color: colors.muted, fontWeight: 500,
+    fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.05em',
+  },
+  autopilotLiveVal: { color: colors.ink, fontWeight: 500 },
 
   // === NEWS AUTOPILOT ===
   autopilotPanel: {
