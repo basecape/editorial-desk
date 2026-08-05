@@ -10,7 +10,7 @@ import {
   MessageSquare, Lightbulb, RotateCcw, Network, Globe,
   Zap, Rocket, Eye, Menu, Home, Calendar, TrendingUp
 } from 'lucide-react';
-import { EVERGREEN_BLUEPRINT } from '../lib/evergreenBlueprint';
+import * as XLSX from 'xlsx';
 
 // ============================================================================
 // DEFAULTS
@@ -708,37 +708,6 @@ export default function EditorialDesk() {
     return out;
   };
 
-  // ---- load the evergreen topical authority blueprint ----
-  const loadEvergreenBlueprint = () => {
-    // Skip ones already in topics (by title match, evergreen only)
-    const existing = new Set(topics.filter(t => t.type === 'evergreen').map(t => t.title.toLowerCase().trim()));
-    const newOnes = EVERGREEN_BLUEPRINT.filter(b => !existing.has(b.title.toLowerCase().trim()));
-    if (newOnes.length === 0) {
-      showToast('All blueprint topics are already loaded', 'info');
-      return;
-    }
-    const stamped = newOnes.map(b => ({
-      id: uid(),
-      type: 'evergreen',
-      title: b.title,
-      keyword: b.keyword,
-      cluster: b.cluster,
-      category: b.category,
-      angle: `Comprehensive evergreen guide for the ${b.cluster} cluster. Anchor article aiming for topical authority on "${b.keyword}".`,
-      whyEvergreen: `Long-tail evergreen — readers searching this question will keep landing here for years. Part of the ${b.cluster} cluster building topical authority for ${b.category}.`,
-      status: 'pending',
-      source: 'blueprint',
-      createdAt: Date.now(),
-    }));
-    setTopics(prev => {
-      const next = [...stamped, ...prev];
-      storage.set('topics', next);
-      return next;
-    });
-    logAction('topic.generate', { count: stamped.length, type: 'evergreen', source: 'blueprint' });
-    showToast(`Loaded ${stamped.length} blueprint topics`, 'success');
-  };
-
   // ---- generate topics ----
   const generateTopics = async (type, seed, count) => {
     if (!seed.trim() && type === 'evergreen') {
@@ -1252,7 +1221,6 @@ Return ONLY a JSON array (no preamble, no fences):
             onBulkAdd={() => setModal({ type: 'bulkSitePages' })}
             onEdit={(page) => setModal({ type: 'editSitePage', page })}
             onDelete={deleteSitePage}
-            onLoadBlueprint={loadEvergreenBlueprint}
             canApprove={canApprove}
             onUpdateCluster={(item, kind, cluster) => {
               if (kind === 'topic') updateTopic(item.id, { cluster });
@@ -2350,7 +2318,7 @@ function ResearchView({
                 key={topic.id}
                 topic={topic}
                 cannibalCheck={topic._canonCheck}
-                onAddToSitemap={() => onAddToSitemap(topic)}
+                onAddToSitemap={onAddToSitemap}
                 onDiscard={() => onDiscardResearchTopic(topic.id)}
                 canApprove={canApprove}
               />
@@ -2372,8 +2340,32 @@ function ResearchView({
 
 function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, canApprove }) {
   const [expanded, setExpanded] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const isCannibalized = cannibalCheck?.cannibalized;
   const categoryLabel = CATEGORY_LABELS[topic.category] || topic.category;
+
+  // Categories the user can pick from — suggested one first
+  const KNOWN_CATEGORIES = [
+    'health_guides', 'women_s_health', 'men_s_health', 'preventive_health',
+    'fitness_training', 'diet_nutrition', 'mental_health', 'medications',
+    'supplements', 'kids_family', 'expert_directory', 'community_social',
+    'health_news', 'tools_calculators', 'my_health_profile',
+    'fitness', 'nutrition', 'beauty',
+  ];
+  const suggestedCategory = topic.category;
+  const orderedCategories = [
+    ...(suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) ? [suggestedCategory] : []),
+    ...KNOWN_CATEGORIES.filter(c => c !== suggestedCategory),
+  ];
+
+  const handleAddClick = () => {
+    setPickerOpen(true);
+  };
+
+  const handlePickCategory = (categoryKey) => {
+    onAddToSitemap({ ...topic, category: categoryKey });
+    setPickerOpen(false);
+  };
 
   return (
     <div style={{
@@ -2421,17 +2413,49 @@ function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, ca
             >
               <Trash2 size={13} />
             </button>
-            <button
-              style={{
-                ...styles.researchAddBtn,
-                ...(isCannibalized ? styles.researchAddBtnMuted : {}),
-              }}
-              onClick={onAddToSitemap}
-              title={isCannibalized ? 'Add anyway (risk of cannibalization)' : 'Add to sitemap + pipeline'}
-            >
-              <Plus size={13} />
-              <span>Add to sitemap</span>
-            </button>
+            <div style={{ position: 'relative' }}>
+              <button
+                style={{
+                  ...styles.researchAddBtn,
+                  ...(isCannibalized ? styles.researchAddBtnMuted : {}),
+                }}
+                onClick={handleAddClick}
+                title="Choose a category and add to sitemap"
+              >
+                <Plus size={13} />
+                <span>Add to sitemap</span>
+              </button>
+              {pickerOpen && (
+                <>
+                  <div style={styles.movePickerBackdrop} onClick={() => setPickerOpen(false)} />
+                  <div style={styles.categoryPicker}>
+                    <div style={styles.movePickerHead}>Which category?</div>
+                    {suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) && (
+                      <div style={styles.categoryPickerHint}>
+                        AI suggested: <strong>{CATEGORY_LABELS[suggestedCategory] || suggestedCategory}</strong>
+                      </div>
+                    )}
+                    <div style={styles.categoryPickerList}>
+                      {orderedCategories.map(catKey => (
+                        <button
+                          key={catKey}
+                          style={{
+                            ...styles.movePickerItem,
+                            ...(catKey === suggestedCategory ? styles.categoryPickerSuggested : {}),
+                          }}
+                          onClick={() => handlePickCategory(catKey)}
+                        >
+                          {CATEGORY_LABELS[catKey] || catKey}
+                          {catKey === suggestedCategory && (
+                            <span style={styles.categoryPickerSuggestedBadge}>suggested</span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -4637,6 +4661,361 @@ function LoginScreen({ onLogin, theme = 'light' }) {
 // DATABASE VIEW — admin tool to inspect / clear / load KV tables
 // ============================================================================
 
+// ============================================================================
+// EXCEL UPLOADER — parse xlsx/csv files and load rows into topics or sitemap
+// ============================================================================
+
+function ExcelUploader({ showToast, onDone }) {
+  const [file, setFile] = useState(null);
+  const [sheetNames, setSheetNames] = useState([]);
+  const [selectedSheet, setSelectedSheet] = useState('');
+  const [rows, setRows] = useState([]);
+  const [headers, setHeaders] = useState([]);
+  const [mapping, setMapping] = useState({});
+  const [target, setTarget] = useState('topics');
+  const [contentType, setContentType] = useState('evergreen');
+  const [mode, setMode] = useState('append');
+  const [defaultCategory, setDefaultCategory] = useState('');
+  const [defaultCluster, setDefaultCluster] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [workbook, setWorkbook] = useState(null);
+
+  const REQUIRED_FIELDS = {
+    topics: ['title'],
+    sitePages: ['title'],
+  };
+  const OPTIONAL_FIELDS = {
+    topics: ['title', 'keyword', 'cluster', 'category', 'angle', 'whyEvergreen', 'whyNow'],
+    sitePages: ['title', 'url', 'keyword', 'cluster', 'category'],
+  };
+
+  const guessColumn = (columns, aliases) => {
+    for (const col of columns) {
+      const norm = String(col).toLowerCase().replace(/[^a-z0-9]/g, '');
+      for (const alias of aliases) {
+        if (norm === alias || norm.includes(alias)) return col;
+      }
+    }
+    return '';
+  };
+
+  const autoMap = (cols) => {
+    return {
+      title: guessColumn(cols, ['title', 'workingtitle', 'name', 'topic', 'article']),
+      keyword: guessColumn(cols, ['keyword', 'primarykeyword', 'seo', 'searchterm']),
+      cluster: guessColumn(cols, ['cluster', 'subsection', 'pillar', 'subcategory', 'topic']),
+      category: guessColumn(cols, ['category', 'section', 'mainmenu', 'hub']),
+      url: guessColumn(cols, ['url', 'slug', 'urlslug', 'link']),
+      angle: guessColumn(cols, ['angle', 'brief', 'description']),
+      whyEvergreen: guessColumn(cols, ['whyevergreen', 'why', 'rationale']),
+      whyNow: guessColumn(cols, ['whynow', 'timeliness']),
+    };
+  };
+
+  const handleFile = async (evt) => {
+    const f = evt.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setLoading(true);
+    try {
+      const buf = await f.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      setWorkbook(wb);
+      setSheetNames(wb.SheetNames);
+      // Auto-select the first sheet
+      const firstSheet = wb.SheetNames[0];
+      setSelectedSheet(firstSheet);
+      parseSheet(wb, firstSheet);
+    } catch (e) {
+      showToast(`Failed to read file: ${e.message}`, 'error');
+    }
+    setLoading(false);
+  };
+
+  const parseSheet = (wb, sheetName) => {
+    const sheet = wb.Sheets[sheetName];
+    // header: 1 gives us an array-of-arrays; we manually detect the header row
+    const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+    if (raw.length === 0) return;
+
+    // Find the first row with 2+ non-empty cells and one that looks like a header (title-like)
+    let headerRowIdx = 0;
+    for (let i = 0; i < Math.min(raw.length, 10); i++) {
+      const cells = raw[i].filter(c => String(c).trim());
+      if (cells.length >= 2) {
+        const lower = cells.map(c => String(c).toLowerCase());
+        if (lower.some(c => /(title|topic|keyword|category|name|working)/i.test(c))) {
+          headerRowIdx = i;
+          break;
+        }
+      }
+    }
+    const headerRow = raw[headerRowIdx].map(h => String(h).trim());
+    const dataRows = raw.slice(headerRowIdx + 1)
+      .map(r => {
+        const obj = {};
+        headerRow.forEach((h, idx) => { if (h) obj[h] = r[idx] === undefined ? '' : String(r[idx]).trim(); });
+        return obj;
+      })
+      .filter(r => Object.values(r).some(v => String(v).trim()));
+
+    const cols = headerRow.filter(Boolean);
+    setHeaders(cols);
+    setRows(dataRows);
+    setMapping(autoMap(cols));
+  };
+
+  const changeSheet = (name) => {
+    setSelectedSheet(name);
+    if (workbook) parseSheet(workbook, name);
+  };
+
+  const normalizeCategory = (val) => {
+    if (!val) return '';
+    return String(val).toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim()
+      .replace(/\s+/g, '_');
+  };
+
+  const buildItems = () => {
+    const uid = () => `${target === 'topics' ? 'tp' : 'sp'}_${Math.random().toString(36).slice(2, 12)}_${Date.now().toString(36)}`;
+    const now = Date.now();
+    return rows.map(row => {
+      const item = {
+        id: uid(),
+        addedAt: now,
+        createdAt: now,
+      };
+      // Copy mapped fields
+      Object.entries(mapping).forEach(([field, col]) => {
+        if (col && row[col] !== undefined && row[col] !== '') {
+          item[field] = String(row[col]).trim();
+        }
+      });
+      // Apply defaults
+      if (!item.category && defaultCategory) item.category = defaultCategory;
+      if (!item.cluster && defaultCluster) item.cluster = defaultCluster;
+      // Normalize category
+      if (item.category) item.category = normalizeCategory(item.category);
+      // Type-specific fields
+      if (target === 'topics') {
+        item.type = contentType;
+        item.status = 'pending';
+        item.source = 'excel_upload';
+      }
+      return item;
+    }).filter(item => item.title);
+  };
+
+  const doUpload = async () => {
+    if (!mapping.title) {
+      showToast('Please map the Title column', 'error');
+      return;
+    }
+    const newItems = buildItems();
+    if (newItems.length === 0) {
+      showToast('No rows have a title — check your mapping', 'error');
+      return;
+    }
+    if (!confirm(`Upload ${newItems.length} ${target === 'topics' ? 'topics' : 'sitemap pages'}?\n\nMode: ${mode === 'replace' ? 'REPLACE all existing' : 'APPEND to existing'}`)) return;
+
+    setLoading(true);
+    try {
+      let finalValue;
+      if (mode === 'replace') {
+        finalValue = newItems;
+      } else {
+        const cur = await fetch('/api/data/' + target, { credentials: 'same-origin' }).then(r => r.json());
+        finalValue = [...newItems, ...(cur.value || [])];
+      }
+      const res = await fetch('/api/data/' + target, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ value: finalValue }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      showToast(`Loaded ${newItems.length} ${target === 'topics' ? 'topics' : 'pages'} — reloading…`, 'success');
+      setTimeout(() => window.location.reload(), 1200);
+    } catch (e) {
+      showToast(`Upload failed: ${e.message}`, 'error');
+    }
+    setLoading(false);
+  };
+
+  const KNOWN_CATEGORIES = [
+    'fitness_training', 'diet_nutrition', 'mental_health', 'preventive_health',
+    'women_s_health', 'men_s_health', 'expert_directory', 'community_social',
+    'medications', 'supplements', 'tools_calculators', 'health_news',
+    'kids_family', 'my_health_profile',
+    'fitness', 'nutrition', 'health_guides', 'beauty',
+  ];
+
+  return (
+    <section style={styles.dbSection}>
+      <h2 style={styles.dbSectionTitle}>Upload Excel or CSV</h2>
+      <p style={styles.dbSectionSub}>
+        Upload .xlsx or .csv files to bulk-load topics or sitemap pages. Columns auto-map from common headers (Title, Keyword, Cluster, Category, URL, Angle). Adjust the mapping if needed.
+      </p>
+
+      {/* File picker */}
+      <div style={styles.excelFileRow}>
+        <label style={styles.excelFileLabel}>
+          <input
+            type="file"
+            accept=".xlsx,.xls,.csv,.tsv"
+            onChange={handleFile}
+            style={{ display: 'none' }}
+          />
+          <FileText size={14} />
+          <span>{file ? file.name : 'Choose Excel or CSV file'}</span>
+        </label>
+        {file && (
+          <button
+            style={styles.dbBtnSubtle}
+            onClick={() => { setFile(null); setRows([]); setHeaders([]); setMapping({}); setWorkbook(null); }}
+          >
+            <X size={12} /> Clear
+          </button>
+        )}
+      </div>
+
+      {loading && <div style={styles.dbLoading}>Reading file…</div>}
+
+      {sheetNames.length > 1 && (
+        <div style={{ marginBottom: 12 }}>
+          <label style={styles.formLabel}>Which sheet?</label>
+          <select value={selectedSheet} onChange={e => changeSheet(e.target.value)} style={styles.topicInput}>
+            {sheetNames.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        </div>
+      )}
+
+      {rows.length > 0 && (
+        <>
+          <div style={styles.excelPreviewBanner}>
+            <div>
+              <strong>{rows.length}</strong> data rows detected · <strong>{headers.length}</strong> columns
+            </div>
+          </div>
+
+          {/* Target selector */}
+          <div style={styles.excelRow}>
+            <div style={{ flex: 1 }}>
+              <label style={styles.formLabel}>Load into</label>
+              <select value={target} onChange={e => setTarget(e.target.value)} style={styles.topicInput}>
+                <option value="topics">Topics (pipeline)</option>
+                <option value="sitePages">Sitemap pages</option>
+              </select>
+            </div>
+            {target === 'topics' && (
+              <div style={{ flex: 1 }}>
+                <label style={styles.formLabel}>Content type</label>
+                <select value={contentType} onChange={e => setContentType(e.target.value)} style={styles.topicInput}>
+                  <option value="evergreen">Evergreen</option>
+                  <option value="news">News</option>
+                  <option value="mythbusting">Mythbust</option>
+                </select>
+              </div>
+            )}
+            <div style={{ flex: 1 }}>
+              <label style={styles.formLabel}>Mode</label>
+              <select value={mode} onChange={e => setMode(e.target.value)} style={styles.topicInput}>
+                <option value="append">Append to existing</option>
+                <option value="replace">Replace all existing</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Column mapping */}
+          <div style={styles.excelMappingSection}>
+            <div style={styles.excelMappingTitle}>Column mapping</div>
+            <div style={styles.excelMappingHint}>
+              Map your Excel columns to the topic fields. Title is required. Others are optional but recommended.
+            </div>
+            <div style={styles.excelMappingGrid}>
+              {OPTIONAL_FIELDS[target].map(field => (
+                <div key={field} style={styles.excelMappingRow}>
+                  <div style={styles.excelMappingField}>
+                    {field}
+                    {REQUIRED_FIELDS[target].includes(field) && <span style={styles.excelMappingRequired}> *</span>}
+                  </div>
+                  <select
+                    value={mapping[field] || ''}
+                    onChange={e => setMapping(m => ({ ...m, [field]: e.target.value }))}
+                    style={styles.excelMappingSelect}
+                  >
+                    <option value="">— skip —</option>
+                    {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Defaults */}
+          <div style={styles.excelRow}>
+            <div style={{ flex: 1 }}>
+              <label style={styles.formLabel}>Default cluster (fallback)</label>
+              <input
+                type="text"
+                value={defaultCluster}
+                onChange={e => setDefaultCluster(e.target.value)}
+                placeholder="e.g. Unclustered"
+                style={styles.topicInput}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={styles.formLabel}>Default category (fallback)</label>
+              <select value={defaultCategory} onChange={e => setDefaultCategory(e.target.value)} style={styles.topicInput}>
+                <option value="">— none —</option>
+                {KNOWN_CATEGORIES.map(c => (
+                  <option key={c} value={c}>{CATEGORY_LABELS[c] || c}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Preview first 3 rows */}
+          <div style={styles.excelPreviewGrid}>
+            <div style={styles.excelPreviewTitle}>Preview (first 3 rows after mapping)</div>
+            {rows.slice(0, 3).map((row, idx) => {
+              const item = {};
+              Object.entries(mapping).forEach(([field, col]) => {
+                if (col && row[col] !== undefined) item[field] = String(row[col]).trim();
+              });
+              return (
+                <div key={idx} style={styles.excelPreviewItem}>
+                  <div style={styles.excelPreviewNum}>{idx + 1}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={styles.excelPreviewTitleText}>{item.title || <em style={{color:'var(--c-muted)'}}>(no title mapped)</em>}</div>
+                    <div style={styles.excelPreviewMeta}>
+                      {item.category && <span>cat: <code>{item.category}</code></span>}
+                      {item.cluster && <span>cluster: {item.cluster}</span>}
+                      {item.keyword && <span>kw: {item.keyword}</span>}
+                      {item.url && <span>url: {item.url}</span>}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <button
+            style={styles.primaryBtn}
+            onClick={doUpload}
+            disabled={loading || !mapping.title}
+          >
+            {loading ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <Download size={13} />}
+            {mode === 'replace' ? 'Replace with' : 'Upload'} {rows.length} {target === 'topics' ? 'topics' : 'pages'}
+          </button>
+        </>
+      )}
+    </section>
+  );
+}
+
 function DatabaseView({ showToast }) {
   const [snapshot, setSnapshot] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -4905,6 +5284,9 @@ function DatabaseView({ showToast }) {
           </button>
         </div>
       </section>
+
+      {/* Upload Excel */}
+      <ExcelUploader showToast={showToast} onDone={loadSnapshot} />
 
       {/* Bulk load JSON */}
       <section style={styles.dbSection}>
@@ -5708,30 +6090,10 @@ function MonthHeatmap({ daysInMonth, dayOfMonth, deployedByDay, dailyTotalTarget
 // SITEMAP / TOPICAL AUTHORITY
 // ============================================================================
 
-function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster, onUpdateCategory, onLoadBlueprint, canApprove }) {
+function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd, onEdit, onDelete, onUpdateCluster, onUpdateCategory, canApprove }) {
   const [viewMode, setViewMode] = useState('list'); // 'list' | 'visual'
   const [collapsed, setCollapsed] = useState({});
   const [typeFilter, setTypeFilter] = useState('evergreen'); // 'all' | 'evergreen' | 'news' | 'mythbusting'
-
-  // Count blueprint progress for the planning banner
-  const blueprintCounts = (() => {
-    // Match by title — any evergreen topic with a matching title to the blueprint counts
-    const evergreenTopics = topics.filter(t => t.type === 'evergreen');
-    const loaded = EVERGREEN_BLUEPRINT.filter(b =>
-      evergreenTopics.some(t => t.title.toLowerCase().trim() === b.title.toLowerCase().trim())
-    ).length;
-    // Written = a matching draft or library item exists
-    const written = EVERGREEN_BLUEPRINT.filter(b => {
-      const lowerTitle = b.title.toLowerCase().trim();
-      return drafts.some(d => d.title.toLowerCase().trim() === lowerTitle)
-        || libraryItems.some(l => l.title.toLowerCase().trim() === lowerTitle);
-    }).length;
-    const deployed = EVERGREEN_BLUEPRINT.filter(b => {
-      const lowerTitle = b.title.toLowerCase().trim();
-      return libraryItems.some(l => l.deployed && l.title.toLowerCase().trim() === lowerTitle);
-    }).length;
-    return { total: EVERGREEN_BLUEPRINT.length, loaded, written, deployed };
-  })();
 
   // Aggregate everything into clusters
   const clusters = {};
@@ -5794,13 +6156,6 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
             </button>
           </div>
         }
-      />
-
-      {/* Planning banner — evergreen blueprint progress */}
-      <BlueprintBanner
-        counts={blueprintCounts}
-        onLoad={onLoadBlueprint}
-        canApprove={canApprove}
       />
 
       {/* Stats strip */}
@@ -5956,55 +6311,9 @@ function SitemapView({ sitePages, topics, drafts, libraryItems, onAdd, onBulkAdd
   );
 }
 
-function BlueprintBanner({ counts, onLoad, canApprove }) {
-  const { total, loaded, written, deployed } = counts;
-  const fullyLoaded = loaded >= total;
-  const loadedPct = Math.round((loaded / total) * 100);
-  const writtenPct = Math.round((written / total) * 100);
-  const deployedPct = Math.round((deployed / total) * 100);
+function BlueprintBanner_REMOVED() { return null; }
 
-  return (
-    <div style={styles.bpBanner}>
-      <div style={styles.bpBannerLeft}>
-        <div style={styles.bpBannerIcon}><Network size={22} /></div>
-        <div>
-          <div style={styles.bpBannerEyebrow}>Topical authority blueprint · Evergreen</div>
-          <div style={styles.bpBannerTitle}>{total} planned topics across 5 categories</div>
-          <div style={styles.bpBannerSub}>
-            {fullyLoaded
-              ? `${loaded} loaded · ${written} written · ${deployed} deployed`
-              : `${loaded} of ${total} loaded into pipeline. Click load to add the rest.`
-            }
-          </div>
-        </div>
-      </div>
-      <div style={styles.bpBannerRight}>
-        <div style={styles.bpProgressBlock}>
-          <div style={styles.bpProgressBars}>
-            <div title={`Loaded: ${loaded}/${total} (${loadedPct}%)`} style={{ ...styles.bpBar, ...styles.bpBarLoaded, width: `${loadedPct}%` }} />
-          </div>
-          <div style={styles.bpProgressBars}>
-            <div title={`Written: ${written}/${total} (${writtenPct}%)`} style={{ ...styles.bpBar, ...styles.bpBarWritten, width: `${writtenPct}%` }} />
-          </div>
-          <div style={styles.bpProgressBars}>
-            <div title={`Deployed: ${deployed}/${total} (${deployedPct}%)`} style={{ ...styles.bpBar, ...styles.bpBarDeployed, width: `${deployedPct}%` }} />
-          </div>
-        </div>
-        {canApprove && (
-          <button
-            onClick={onLoad}
-            disabled={fullyLoaded}
-            style={{ ...styles.primaryBtn, ...(fullyLoaded ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
-          >
-            {fullyLoaded ? <><Check size={15} /> All loaded</> : <><Download size={15} /> Load blueprint</>}
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDelete }) {
+function SitemapTreeList({ clusterEntries, collapsed, setCollapsed, onEdit, onDelete, onUpdateCategory }) {
   // Build hierarchy: category → cluster → pages
   const tree = {};
   clusterEntries.forEach(([clusterName, buckets]) => {
@@ -6795,6 +7104,61 @@ const styles = {
   targetTypeBadge: { fontSize: 9.5, fontWeight: 700, padding: '2px 5px', borderRadius: 3, letterSpacing: '0.05em', lineHeight: 1 },
   targetSelect: { padding: '3px 4px 3px 6px', fontSize: 12.5, border: 'none', background: 'transparent', fontFamily: 'ui-monospace, monospace', color: colors.ink, fontWeight: 600, cursor: 'pointer', outline: 'none' },
 
+  // === EXCEL UPLOADER ===
+  excelFileRow: { display: 'flex', gap: 10, alignItems: 'center', marginBottom: 12 },
+  excelFileLabel: {
+    display: 'inline-flex', alignItems: 'center', gap: 8,
+    padding: '10px 14px', background: colors.bg,
+    border: `1px dashed ${colors.border}`, borderRadius: 5,
+    cursor: 'pointer', fontSize: 12.5, color: colors.ink, flex: 1,
+    fontFamily: fonts.body, transition: 'border-color 0.2s',
+  },
+  excelPreviewBanner: {
+    padding: '8px 12px', background: 'rgba(45, 95, 78, 0.08)',
+    border: `1px solid ${colors.green}`, borderRadius: 5,
+    fontSize: 12.5, color: colors.ink, marginBottom: 12,
+  },
+  excelRow: { display: 'flex', gap: 12, marginBottom: 12, flexWrap: 'wrap' },
+  excelMappingSection: {
+    background: colors.bg, padding: 12, borderRadius: 5,
+    border: `1px solid ${colors.borderSoft}`, marginBottom: 12,
+  },
+  excelMappingTitle: { fontSize: 12, fontWeight: 700, color: colors.ink, letterSpacing: '0.05em', textTransform: 'uppercase', marginBottom: 3 },
+  excelMappingHint: { fontSize: 11, color: colors.muted, marginBottom: 10, lineHeight: 1.4 },
+  excelMappingGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 },
+  excelMappingRow: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    padding: '6px 10px', background: colors.surface,
+    border: `1px solid ${colors.borderSoft}`, borderRadius: 4,
+  },
+  excelMappingField: { fontSize: 11.5, fontWeight: 600, color: colors.ink, minWidth: 78, fontFamily: 'ui-monospace, monospace' },
+  excelMappingRequired: { color: '#A14438' },
+  excelMappingSelect: {
+    flex: 1, padding: '4px 6px', fontSize: 11.5,
+    border: `1px solid ${colors.border}`, borderRadius: 3,
+    background: colors.inputBg, color: colors.ink, fontFamily: fonts.body,
+  },
+  excelPreviewGrid: {
+    padding: 10, background: colors.bg,
+    border: `1px solid ${colors.borderSoft}`, borderRadius: 5,
+    marginBottom: 12,
+  },
+  excelPreviewTitle: { fontSize: 11, fontWeight: 700, color: colors.muted, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 },
+  excelPreviewItem: {
+    display: 'flex', gap: 10, padding: '6px 0',
+    borderTop: `1px solid ${colors.borderSoft}`, alignItems: 'flex-start',
+  },
+  excelPreviewNum: {
+    width: 20, height: 20, background: colors.green, color: '#fff',
+    borderRadius: '50%', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+    fontSize: 11, fontWeight: 700, flexShrink: 0,
+  },
+  excelPreviewTitleText: { fontSize: 12.5, fontWeight: 600, color: colors.ink, marginBottom: 3 },
+  excelPreviewMeta: {
+    fontSize: 11, color: colors.muted, display: 'flex',
+    gap: 10, flexWrap: 'wrap',
+  },
+
   // === LOADING PROGRESS BAR ===
   loadingProgressTrack: {
     width: '85%', maxWidth: 320, height: 5,
@@ -7124,6 +7488,34 @@ const styles = {
     borderColor: colors.green, background: colors.bg, color: colors.ink, fontWeight: 600,
   },
   settingsTabHelp: { fontSize: 10.5, color: colors.faint, fontWeight: 400 },
+
+  // === CATEGORY PICKER (in research card) ===
+  categoryPicker: {
+    position: 'absolute', top: 32, right: 0,
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 6, boxShadow: '0 6px 20px rgba(0,0,0,0.15)',
+    zIndex: 101, minWidth: 240, padding: 6,
+    maxHeight: 380, overflow: 'hidden',
+    display: 'flex', flexDirection: 'column',
+  },
+  categoryPickerHint: {
+    fontSize: 10.5, color: colors.muted, padding: '4px 8px 8px',
+    borderBottom: `1px solid ${colors.borderSoft}`, marginBottom: 4,
+  },
+  categoryPickerList: {
+    overflowY: 'auto', maxHeight: 300,
+    display: 'flex', flexDirection: 'column',
+  },
+  categoryPickerSuggested: {
+    background: 'rgba(45, 95, 78, 0.06)',
+    fontWeight: 600, position: 'relative',
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+  },
+  categoryPickerSuggestedBadge: {
+    fontSize: 9.5, fontWeight: 700, textTransform: 'uppercase',
+    background: colors.green, color: '#fff',
+    padding: '2px 6px', borderRadius: 3, letterSpacing: '0.05em',
+  },
 
   // === MOVE-TO-CATEGORY PICKER ===
   movePickerBackdrop: {
