@@ -497,16 +497,38 @@ export default function EditorialDesk() {
     if (options.learnFromEdits && options.originalContent && options.originalContent.trim() !== draft.content.trim()) {
       await learnFromEdits(options.originalContent, draft.content, draft.category, draft.title);
     }
-    const published = { ...draft, status: 'published', publishedAt: Date.now() };
+    // If a specific category was picked at publish time, apply it
+    const finalCategory = options.publishCategory || draft.category;
+    const published = { ...draft, category: finalCategory, status: 'published', publishedAt: Date.now() };
     setLibraryItems(prev => {
       const next = [published, ...prev];
       storage.set('library', next);
       return next;
     });
+    // Auto-add to sitemap unless the user opted out
+    if (options.addToSitemap !== false) {
+      const newPage = {
+        id: uid(),
+        title: draft.title,
+        url: draft.wpLink || '',
+        keyword: draft.keyword || '',
+        cluster: draft.cluster || 'Unclustered',
+        category: finalCategory,
+        type: draft.type,
+        addedAt: Date.now(),
+        fromPublish: true,
+        sourceDraftId: draft.id,
+      };
+      setSitePages(prev => {
+        const next = [newPage, ...prev];
+        storage.set('sitePages', next);
+        return next;
+      });
+    }
     deleteDraft(draft.id);
-    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type, category: draft.category, learnedFromEdits: !!options.learnFromEdits });
+    logAction('draft.approve', { draftId: draft.id, title: draft.title, type: draft.type, category: finalCategory, learnedFromEdits: !!options.learnFromEdits });
     setModal(null);
-    showToast('Published to library', 'success');
+    showToast(`Published to library${options.addToSitemap !== false ? ' and sitemap' : ''}`, 'success');
   };
   const deleteLibraryItem = (id) => {
     setLibraryItems(prev => {
@@ -828,7 +850,7 @@ export default function EditorialDesk() {
           setDrafts(draftsData.value || []);
         }
       } catch {}
-    }, 15000); // 15 seconds
+    }, 5000); // 5 seconds — poll fast while queue is active so the progress bar reflects worker state
 
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1264,33 +1286,9 @@ Return ONLY a JSON array (no preamble, no fences):
             drafts={drafts}
             libraryItems={libraryItems}
             topics={topics}
-            onAddToSitemap={(topic) => {
-              // Create a sitemap page from the topic — tagged with type so clear-by-type finds it
-              const newPage = {
-                id: uid(),
-                title: topic.title,
-                url: '',
-                keyword: topic.keyword || '',
-                cluster: topic.cluster || 'Unclustered',
-                category: topic.category || '',
-                type: topic.type,
-                addedAt: Date.now(),
-                fromResearch: true,
-                sourceTopicId: topic.id,
-              };
-              setSitePages(prev => {
-                const next = [newPage, ...prev];
-                storage.set('sitePages', next);
-                return next;
-              });
-              // Also add as a pending topic in the pipeline
-              const topicClean = { ...topic, status: 'pending', addedToSitemap: true, addedAt: Date.now() };
-              setTopics(prev => {
-                const next = [topicClean, ...prev.filter(t => t.id !== topic.id)];
-                storage.set('topics', next);
-                return next;
-              });
-              showToast(`Added "${topic.title.slice(0, 40)}…" to sitemap and pipeline`, 'success');
+            onApproveToWrite={(topic) => {
+              // Move topic from 'research' to 'queued' and kick off the server worker.
+              writeArticle(topic);
             }}
             onDiscardResearchTopic={(topicId) => {
               setTopics(prev => {
@@ -2183,7 +2181,7 @@ function NewsAutopilotPanel({ canApprove }) {
 function ResearchView({
   type, seed, onSeedChange, onGenerate,
   sitePages, drafts, libraryItems, topics,
-  onAddToSitemap, onDiscardResearchTopic, canApprove
+  onApproveToWrite, onDiscardResearchTopic, canApprove
 }) {
   const [count, setCount] = useState(10);
   const [searchQuery, setSearchQuery] = useState('');
@@ -2242,7 +2240,7 @@ function ResearchView({
       <PageHead
         eyebrow={meta.eyebrow}
         title={meta.label}
-        sub={`Generate ${type} topic ideas with web research. Each idea is checked against your existing sitemap, drafts, and library to spot cannibalization. Add unique ones to the sitemap, discard the rest.`}
+        sub={`Generate ${type} topic ideas with web research. Each idea is checked against your existing sitemap, drafts, and library to spot cannibalization. Approve unique ones to start writing immediately — you'll pick where they publish when you review the finished draft.`}
       />
 
       {/* Seed input + generate */}
@@ -2320,7 +2318,7 @@ function ResearchView({
                 key={topic.id}
                 topic={topic}
                 cannibalCheck={topic._canonCheck}
-                onAddToSitemap={onAddToSitemap}
+                onApproveToWrite={onApproveToWrite}
                 onDiscard={() => onDiscardResearchTopic(topic.id)}
                 canApprove={canApprove}
               />
@@ -2340,34 +2338,10 @@ function ResearchView({
   );
 }
 
-function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, canApprove }) {
+function ResearchTopicCard({ topic, cannibalCheck, onApproveToWrite, onDiscard, canApprove }) {
   const [expanded, setExpanded] = useState(false);
-  const [pickerOpen, setPickerOpen] = useState(false);
   const isCannibalized = cannibalCheck?.cannibalized;
   const categoryLabel = CATEGORY_LABELS[topic.category] || topic.category;
-
-  // Categories the user can pick from — suggested one first
-  const KNOWN_CATEGORIES = [
-    'health_guides', 'women_s_health', 'men_s_health', 'preventive_health',
-    'fitness_training', 'diet_nutrition', 'mental_health', 'medications',
-    'supplements', 'kids_family', 'expert_directory', 'community_social',
-    'health_news', 'tools_calculators', 'my_health_profile',
-    'fitness', 'nutrition', 'beauty',
-  ];
-  const suggestedCategory = topic.category;
-  const orderedCategories = [
-    ...(suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) ? [suggestedCategory] : []),
-    ...KNOWN_CATEGORIES.filter(c => c !== suggestedCategory),
-  ];
-
-  const handleAddClick = () => {
-    setPickerOpen(true);
-  };
-
-  const handlePickCategory = (categoryKey) => {
-    onAddToSitemap({ ...topic, category: categoryKey });
-    setPickerOpen(false);
-  };
 
   return (
     <div style={{
@@ -2440,57 +2414,15 @@ function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, ca
                 ...styles.researchAddBtn,
                 ...(isCannibalized ? styles.researchAddBtnMuted : {}),
               }}
-              onClick={handleAddClick}
-              title="Choose a category and add to sitemap"
+              onClick={() => onApproveToWrite(topic)}
+              title={isCannibalized ? 'Approve anyway — will write the article' : 'Approve and start writing the article'}
             >
-              <Plus size={13} />
-              <span>Add to sitemap</span>
+              <Check size={13} />
+              <span>Approve to write</span>
             </button>
           </div>
         )}
       </div>
-
-      {/* Category picker MODAL — full-screen popup */}
-      {pickerOpen && (
-        <div style={styles.catModalBackdrop} onClick={() => setPickerOpen(false)}>
-          <div style={styles.catModal} onClick={e => e.stopPropagation()}>
-            <div style={styles.catModalHeader}>
-              <div>
-                <div style={styles.catModalEyebrow}>Add to sitemap</div>
-                <div style={styles.catModalTitle}>Which category?</div>
-                <div style={styles.catModalTopic}>"{topic.title}"</div>
-              </div>
-              <button style={styles.catModalClose} onClick={() => setPickerOpen(false)}>
-                <X size={16} />
-              </button>
-            </div>
-
-            {suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) && (
-              <div style={styles.catModalHint}>
-                AI suggested: <strong>{CATEGORY_LABELS[suggestedCategory] || suggestedCategory}</strong>
-              </div>
-            )}
-
-            <div style={styles.catModalList}>
-              {orderedCategories.map(catKey => (
-                <button
-                  key={catKey}
-                  style={{
-                    ...styles.catModalItem,
-                    ...(catKey === suggestedCategory ? styles.catModalItemSuggested : {}),
-                  }}
-                  onClick={() => handlePickCategory(catKey)}
-                >
-                  <span>{CATEGORY_LABELS[catKey] || catKey}</span>
-                  {catKey === suggestedCategory && (
-                    <span style={styles.catModalBadge}>SUGGESTED</span>
-                  )}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
 
       {expanded && (
         <div style={styles.researchCardDetails}>
@@ -2951,13 +2883,15 @@ function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate,
   const [expanded, setExpanded] = useState(false);
   const [, forceTick] = useState(0);
   const isWriting = topic.status === 'writing';
+  const isQueued = topic.status === 'queued';
+  const isActive = isWriting || isQueued;
 
-  // While writing, tick every second so elapsed time + progress bar update
+  // Tick every second so elapsed time + progress bar update smoothly
   useEffect(() => {
-    if (!isWriting) return;
+    if (!isActive) return;
     const interval = setInterval(() => forceTick(t => t + 1), 1000);
     return () => clearInterval(interval);
-  }, [isWriting]);
+  }, [isActive]);
 
   const statusColor = {
     pending: '#C77D4A',
@@ -2970,14 +2904,15 @@ function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate,
 
   const categoryLabel = CATEGORY_LABELS[topic.category] || topic.category;
 
-  // Time elapsed while writing + estimated progress
-  const writingElapsed = isWriting && topic.writingStartedAt
-    ? Math.floor((Date.now() - topic.writingStartedAt) / 1000)
+  // Combined elapsed timer: starts when queued, continues through writing
+  const activeStartedAt = topic.writingStartedAt || topic.queuedAt || Date.now();
+  const activeElapsed = isActive
+    ? Math.floor((Date.now() - activeStartedAt) / 1000)
     : 0;
-  // Estimated write time is 90s. Show progress up to 95% max until actually done.
-  const ESTIMATED_WRITE_SECONDS = 90;
-  const writingProgress = isWriting
-    ? Math.min(95, Math.round((writingElapsed / ESTIMATED_WRITE_SECONDS) * 100))
+  // Estimated total time: 20s queue wait + 90s write = ~110s
+  const ESTIMATED_TOTAL_SECONDS = 110;
+  const progressPct = isActive
+    ? Math.min(95, Math.round((activeElapsed / ESTIMATED_TOTAL_SECONDS) * 100))
     : 0;
 
   return (
@@ -3016,20 +2951,17 @@ function TopicRow({ topic, onApproveWrite, onRetryFailed, onReject, onReinstate,
               <Eye size={11} /> awaiting review
             </span>
           )}
-          {topic.status === 'queued' && (
-            <span style={styles.queuedChip} title="Waiting for an open slot">
-              <Loader2 size={11} /> queued
-            </span>
-          )}
-          {isWriting && (
+          {isActive && (
             <div style={styles.writingProgress}>
               <div style={styles.writingChipInline}>
                 <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} />
-                <span style={styles.writingChipLabel}>writing</span>
-                <span style={styles.writingElapsed}>{writingElapsed}s</span>
+                <span style={styles.writingChipLabel}>
+                  {isQueued ? 'starting' : 'writing'}
+                </span>
+                <span style={styles.writingElapsed}>{activeElapsed}s</span>
               </div>
               <div style={styles.writingBar}>
-                <div style={{ ...styles.writingBarFill, width: `${writingProgress}%` }} />
+                <div style={{ ...styles.writingBarFill, width: `${progressPct}%` }} />
               </div>
             </div>
           )}
@@ -3637,15 +3569,32 @@ function DraftView({ draft, fromLibrary, onSave, onLearnFromEdits, onPublish, on
     catch { showToast('Copy failed', 'error'); }
   };
 
+  const [pendingPublishOptions, setPendingPublishOptions] = useState(null);
+
   const handleApproveClick = () => {
-    // Always save first if there are edits
+    // If edits exist, save + go through learn-prompt; then category picker
     if (hasEdits) {
       onSave({ content });
       setConfirmStep('learn-prompt');
     } else {
-      onPublish({ learnFromEdits: false });
+      // Go straight to category picker
+      setPendingPublishOptions({ learnFromEdits: false });
+      setConfirmStep('publish-category');
     }
   };
+
+  const KNOWN_CATEGORIES = [
+    'health_guides', 'women_s_health', 'men_s_health', 'preventive_health',
+    'fitness_training', 'diet_nutrition', 'mental_health', 'medications',
+    'supplements', 'kids_family', 'expert_directory', 'community_social',
+    'health_news', 'tools_calculators', 'my_health_profile',
+    'fitness', 'nutrition', 'beauty',
+  ];
+  const suggestedCategory = draft.category;
+  const orderedCategories = [
+    ...(suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) ? [suggestedCategory] : []),
+    ...KNOWN_CATEGORIES.filter(c => c !== suggestedCategory),
+  ];
 
   return (
     <div style={styles.draftViewPanel}>
@@ -3712,13 +3661,65 @@ function DraftView({ draft, fromLibrary, onSave, onLearnFromEdits, onPublish, on
             I can compare your edited version to the original AI draft and extract 1–3 patterns to add to the <strong>{draft.category}</strong> category training. Future articles in this category will follow your patterns automatically.
           </p>
           <div style={styles.learnPromptActions}>
-            <button style={styles.secondaryBtn} onClick={() => onPublish({ learnFromEdits: false })}>
-              Skip — just publish
+            <button
+              style={styles.secondaryBtn}
+              onClick={() => {
+                setPendingPublishOptions({ learnFromEdits: false });
+                setConfirmStep('publish-category');
+              }}
+            >
+              Skip — go to publish
             </button>
-            <button style={styles.primaryBtn} onClick={() => onPublish({ learnFromEdits: true, originalContent })}>
-              <GraduationCap size={15} /> Learn & publish
+            <button
+              style={styles.primaryBtn}
+              onClick={() => {
+                setPendingPublishOptions({ learnFromEdits: true, originalContent });
+                setConfirmStep('publish-category');
+              }}
+            >
+              <GraduationCap size={15} /> Learn & continue
             </button>
           </div>
+        </div>
+      ) : confirmStep === 'publish-category' ? (
+        <div style={styles.learnPrompt}>
+          <div style={styles.learnPromptIcon}><Network size={28} /></div>
+          <h3 style={styles.learnPromptTitle}>Where should this publish?</h3>
+          <p style={styles.learnPromptBody}>
+            Pick the category — the article will publish to your library, get added to the sitemap under this category, and be ready to push to WordPress.
+          </p>
+          {suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) && (
+            <div style={styles.publishHint}>
+              AI suggested: <strong>{CATEGORY_LABELS[suggestedCategory] || suggestedCategory}</strong>
+            </div>
+          )}
+          <div style={styles.publishCatList}>
+            {orderedCategories.map(catKey => (
+              <button
+                key={catKey}
+                style={{
+                  ...styles.publishCatItem,
+                  ...(catKey === suggestedCategory ? styles.publishCatItemSuggested : {}),
+                }}
+                onClick={() => {
+                  onPublish({ ...pendingPublishOptions, publishCategory: catKey });
+                  setConfirmStep(null);
+                  setPendingPublishOptions(null);
+                }}
+              >
+                <span>{CATEGORY_LABELS[catKey] || catKey}</span>
+                {catKey === suggestedCategory && (
+                  <span style={styles.publishCatBadge}>SUGGESTED</span>
+                )}
+              </button>
+            ))}
+          </div>
+          <button
+            style={styles.learnPromptCancel}
+            onClick={() => { setConfirmStep(null); setPendingPublishOptions(null); }}
+          >
+            ← Back to editing
+          </button>
         </div>
       ) : (
         <>
@@ -7708,6 +7709,35 @@ const styles = {
     letterSpacing: '0.05em', color: colors.muted, whiteSpace: 'nowrap',
     padding: '2px 6px', background: colors.bg, borderRadius: 3,
     flexShrink: 0, height: 'fit-content', marginTop: 1,
+  },
+
+  // === PUBLISH CATEGORY PICKER ===
+  publishHint: {
+    padding: '8px 12px', fontSize: 12,
+    background: 'rgba(45, 95, 78, 0.08)',
+    color: colors.ink, borderRadius: 4,
+    marginBottom: 12,
+  },
+  publishCatList: {
+    display: 'flex', flexDirection: 'column', gap: 4,
+    maxHeight: 320, overflowY: 'auto', margin: '4px 0 12px',
+  },
+  publishCatItem: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    width: '100%', padding: '11px 14px',
+    background: colors.surface, border: `1px solid ${colors.border}`,
+    borderRadius: 5,
+    fontFamily: fonts.body, fontSize: 13.5, color: colors.ink,
+    textAlign: 'left', cursor: 'pointer',
+  },
+  publishCatItemSuggested: {
+    background: 'rgba(45, 95, 78, 0.08)',
+    borderColor: colors.green, fontWeight: 600,
+  },
+  publishCatBadge: {
+    fontSize: 9.5, fontWeight: 700, letterSpacing: '0.06em',
+    background: colors.green, color: '#fff',
+    padding: '3px 8px', borderRadius: 3,
   },
 
   // === CATEGORY PICKER MODAL (popup) ===
