@@ -849,6 +849,13 @@ export default function EditorialDesk() {
           const draftsData = await draftsRes.json();
           setDrafts(draftsData.value || []);
         }
+        // Safety net: if there are queued topics but nothing writing, nudge the worker
+        // (server should self-trigger, but this catches the case where that link broke)
+        const stillQueued = fresh.filter(t => t.status === 'queued').length;
+        const stillWriting = fresh.filter(t => t.status === 'writing').length;
+        if (stillQueued > 0 && stillWriting === 0) {
+          fetch('/api/queue/process', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+        }
       } catch {}
     }, 5000); // 5 seconds — poll fast while queue is active so the progress bar reflects worker state
 
@@ -2829,8 +2836,10 @@ function CategoryAccordion({ items, renderRow, storageKey }) {
 
 function WriteQueueBanner({ queueState, failedCount, onRetryAll, writtenCount = 0 }) {
   const { waiting, inFlight } = queueState;
-  const active = inFlight > 0 || waiting > 0;
-  const totalInPlay = waiting + inFlight + writtenCount;
+  // Treat queued and in-flight as one "writing" state — user perspective, not worker perspective
+  const totalWriting = waiting + inFlight;
+  const active = totalWriting > 0;
+  const totalInPlay = totalWriting + writtenCount;
   const overallPct = totalInPlay > 0 ? Math.round((writtenCount / totalInPlay) * 100) : 0;
 
   return (
@@ -2844,7 +2853,7 @@ function WriteQueueBanner({ queueState, failedCount, onRetryAll, writtenCount = 
         <div style={{ flex: 1, minWidth: 0 }}>
           {active && (
             <div style={styles.queueBannerTitle}>
-              Writing in progress · {inFlight} active{waiting > 0 ? `, ${waiting} queued` : ''}{writtenCount > 0 ? `, ${writtenCount} done` : ''}
+              Writing in progress · {totalWriting} {totalWriting === 1 ? 'article' : 'articles'}{writtenCount > 0 ? `, ${writtenCount} done` : ''}
             </div>
           )}
           {!active && failedCount > 0 && (
@@ -2854,7 +2863,7 @@ function WriteQueueBanner({ queueState, failedCount, onRetryAll, writtenCount = 
           )}
           <div style={styles.queueBannerSub}>
             {active && 'Articles are being written server-side. You can safely close the tab — writes continue in the background.'}
-            {!active && failedCount > 0 && 'Tap retry to requeue — the server worker will pick them up on its next run.'}
+            {!active && failedCount > 0 && 'Tap retry to start writing again.'}
           </div>
           {active && totalInPlay > 0 && (
             <div style={styles.queueBannerProgressWrap}>

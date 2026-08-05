@@ -128,13 +128,36 @@ async function runWorker(source) {
       results.push({ topicId: queued[i].id, title: queued[i].title, ...r });
     }
 
-    return {
+    // Check if there are still queued topics after this run — if so, self-trigger
+    const remainingTopics = (await kv.get('topics')) || [];
+    const remainingQueued = remainingTopics.filter(t => t.status === 'queued').length;
+
+    const result = {
       source, processed: results.length, results,
       durationMs: Date.now() - startTime,
-      queueRemaining: queued.length - results.filter(r => r.success || r.skipped === false).length,
+      queueRemaining: remainingQueued,
     };
+
+    // Self-trigger if more queued topics remain — release lock FIRST so the next call gets it
+    if (remainingQueued > 0) {
+      await releaseLock();
+      // Fire-and-forget — don't await, don't block the response
+      const proto = process.env.VERCEL_URL ? 'https' : 'http';
+      const host = process.env.VERCEL_URL || 'localhost:3000';
+      const cronSecret = process.env.CRON_SECRET;
+      if (cronSecret) {
+        fetch(`${proto}://${host}/api/queue/process`, {
+          method: 'GET',
+          headers: { authorization: `Bearer ${cronSecret}` },
+        }).catch(() => {});
+      }
+      result.selfTriggered = true;
+      return result;
+    }
+    return result;
   } finally {
-    await releaseLock();
+    // Release lock if not already released via self-trigger path
+    try { await releaseLock(); } catch {}
   }
 }
 
