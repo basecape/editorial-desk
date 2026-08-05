@@ -1497,6 +1497,8 @@ Return ONLY a JSON array (no preamble, no fences):
 
 function buildTopicPrompt(type, seed, count, instructions, sitemapContext = '') {
   const siteBlock = sitemapContext ? `\n\n${sitemapContext}\n` : '';
+  const CATEGORY_LIST = `"fitness_training" | "diet_nutrition" | "mental_health" | "preventive_health" | "women_s_health" | "men_s_health" | "expert_directory" | "community_social" | "medications" | "supplements" | "tools_calculators" | "health_news" | "kids_family" | "my_health_profile"`;
+
   if (type === 'evergreen') {
     return `${instructions}${siteBlock}
 
@@ -1515,16 +1517,16 @@ Mix angles widely:
 - SA-specific contexts (medical aid, public clinics, local foods, climate)
 - Common reader questions
 
-Vary across categories: fitness, nutrition, mental_health, health_guides, beauty.
+Vary across categories: ${CATEGORY_LIST}.
 
-Return ONLY a JSON array (no markdown fences, no preamble). Each item:
+Return ONLY a JSON array (no markdown fences, no preamble). Each item MUST include ALL of these fields:
 {
   "title": "working title under 65 chars",
-  "angle": "one sentence on the take",
+  "angle": "one clear sentence describing the take and what makes this article different — REQUIRED",
   "keyword": "primary SEO keyword (must NOT match any existing keyword above)",
   "cluster": "topical cluster — existing one from the sitemap, or a new cluster name",
-  "whyEvergreen": "why this stays relevant year-round",
-  "category": "fitness" | "nutrition" | "mental_health" | "health_guides" | "beauty",
+  "whyEvergreen": "one sentence on why this stays relevant year-round — REQUIRED",
+  "category": ${CATEGORY_LIST},
   "effort": "quick" | "standard" | "deep"
 }`;
   }
@@ -1548,17 +1550,17 @@ Style of headline (mix these patterns):
 
 Each topic must be tied to a SPECIFIC myth, claim, or trend (not a generic explainer). The article should always land on the evidence-backed answer, never just dunk on people.
 
-Vary across categories: fitness, nutrition, mental_health, health_guides, beauty.
+Vary across categories: ${CATEGORY_LIST}.
 
-Return ONLY a JSON array (no markdown fences, no preamble). Each item:
+Return ONLY a JSON array (no markdown fences, no preamble). Each item MUST include ALL of these fields:
 {
   "title": "punchy headline under 65 chars",
-  "angle": "the actual answer — what evidence really says",
+  "angle": "one clear sentence — the actual answer, what evidence really says — REQUIRED",
   "keyword": "primary SEO keyword (must NOT match any existing keyword above)",
   "cluster": "topical cluster — existing one from the sitemap, or a new cluster name",
-  "theMyth": "the exact claim being debunked, in one sentence",
-  "theTruth": "what evidence actually says, in one sentence",
-  "category": "fitness" | "nutrition" | "mental_health" | "health_guides" | "beauty",
+  "theMyth": "the exact claim being debunked, in one sentence — REQUIRED",
+  "theTruth": "what evidence actually says, in one sentence — REQUIRED",
+  "category": ${CATEGORY_LIST},
   "effort": "quick" | "standard" | "deep"
 }`;
   }
@@ -1571,17 +1573,17 @@ Search current South African health news, recent peer-reviewed studies (last 60 
 
 Each topic must be tied to a SPECIFIC recent event, study, policy change, season, or trend. No evergreen pieces.
 
-Vary across categories: fitness, nutrition, mental_health, health_guides, beauty.
+Vary across categories: ${CATEGORY_LIST}.
 
-Return ONLY a JSON array (no markdown fences, no preamble). Each item:
+Return ONLY a JSON array (no markdown fences, no preamble). Each item MUST include ALL of these fields:
 {
   "title": "working title under 65 chars",
-  "angle": "one sentence on the take",
+  "angle": "one clear sentence describing the take — REQUIRED",
   "keyword": "primary SEO keyword (must NOT match any existing keyword above)",
   "cluster": "topical cluster — existing one from the sitemap, or a new cluster name",
-  "whyNow": "the specific news hook, study, or trigger with date",
+  "whyNow": "the specific news hook, study, or trigger with date — REQUIRED",
   "source": "the publication or body the hook came from",
-  "category": "fitness" | "nutrition" | "mental_health" | "health_guides" | "beauty",
+  "category": ${CATEGORY_LIST},
   "effort": "quick" | "standard" | "deep"
 }`;
 }
@@ -2397,6 +2399,26 @@ function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, ca
             {topic.cluster && <><span style={styles.cardDot}>·</span><span>{topic.cluster}</span></>}
             {topic.keyword && <><span style={styles.cardDot}>·</span><span style={styles.kwTag}>{topic.keyword}</span></>}
           </div>
+          {topic.angle && (
+            <div style={styles.researchCardAngle}>
+              <span style={styles.researchCardAngleLabel}>Angle</span>
+              <span>{topic.angle}</span>
+            </div>
+          )}
+          {(topic.whyEvergreen || topic.whyNow || topic.theMyth) && (
+            <div style={styles.researchCardAngle}>
+              <span style={styles.researchCardAngleLabel}>
+                {topic.whyEvergreen ? 'Why evergreen' : topic.whyNow ? 'Why now' : 'The myth'}
+              </span>
+              <span>{topic.whyEvergreen || topic.whyNow || topic.theMyth}</span>
+            </div>
+          )}
+          {topic.theTruth && (
+            <div style={styles.researchCardAngle}>
+              <span style={styles.researchCardAngleLabel}>The truth</span>
+              <span>{topic.theTruth}</span>
+            </div>
+          )}
           {isCannibalized && (
             <div style={styles.researchCannibalNote}>
               Similar to existing {cannibalCheck.matchKind}: <em>"{cannibalCheck.matchTitle}"</em>
@@ -2413,52 +2435,62 @@ function ResearchTopicCard({ topic, cannibalCheck, onAddToSitemap, onDiscard, ca
             >
               <Trash2 size={13} />
             </button>
-            <div style={{ position: 'relative' }}>
-              <button
-                style={{
-                  ...styles.researchAddBtn,
-                  ...(isCannibalized ? styles.researchAddBtnMuted : {}),
-                }}
-                onClick={handleAddClick}
-                title="Choose a category and add to sitemap"
-              >
-                <Plus size={13} />
-                <span>Add to sitemap</span>
-              </button>
-              {pickerOpen && (
-                <>
-                  <div style={styles.movePickerBackdrop} onClick={() => setPickerOpen(false)} />
-                  <div style={styles.categoryPicker}>
-                    <div style={styles.movePickerHead}>Which category?</div>
-                    {suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) && (
-                      <div style={styles.categoryPickerHint}>
-                        AI suggested: <strong>{CATEGORY_LABELS[suggestedCategory] || suggestedCategory}</strong>
-                      </div>
-                    )}
-                    <div style={styles.categoryPickerList}>
-                      {orderedCategories.map(catKey => (
-                        <button
-                          key={catKey}
-                          style={{
-                            ...styles.movePickerItem,
-                            ...(catKey === suggestedCategory ? styles.categoryPickerSuggested : {}),
-                          }}
-                          onClick={() => handlePickCategory(catKey)}
-                        >
-                          {CATEGORY_LABELS[catKey] || catKey}
-                          {catKey === suggestedCategory && (
-                            <span style={styles.categoryPickerSuggestedBadge}>suggested</span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
+            <button
+              style={{
+                ...styles.researchAddBtn,
+                ...(isCannibalized ? styles.researchAddBtnMuted : {}),
+              }}
+              onClick={handleAddClick}
+              title="Choose a category and add to sitemap"
+            >
+              <Plus size={13} />
+              <span>Add to sitemap</span>
+            </button>
           </div>
         )}
       </div>
+
+      {/* Category picker MODAL — full-screen popup */}
+      {pickerOpen && (
+        <div style={styles.catModalBackdrop} onClick={() => setPickerOpen(false)}>
+          <div style={styles.catModal} onClick={e => e.stopPropagation()}>
+            <div style={styles.catModalHeader}>
+              <div>
+                <div style={styles.catModalEyebrow}>Add to sitemap</div>
+                <div style={styles.catModalTitle}>Which category?</div>
+                <div style={styles.catModalTopic}>"{topic.title}"</div>
+              </div>
+              <button style={styles.catModalClose} onClick={() => setPickerOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+
+            {suggestedCategory && KNOWN_CATEGORIES.includes(suggestedCategory) && (
+              <div style={styles.catModalHint}>
+                AI suggested: <strong>{CATEGORY_LABELS[suggestedCategory] || suggestedCategory}</strong>
+              </div>
+            )}
+
+            <div style={styles.catModalList}>
+              {orderedCategories.map(catKey => (
+                <button
+                  key={catKey}
+                  style={{
+                    ...styles.catModalItem,
+                    ...(catKey === suggestedCategory ? styles.catModalItemSuggested : {}),
+                  }}
+                  onClick={() => handlePickCategory(catKey)}
+                >
+                  <span>{CATEGORY_LABELS[catKey] || catKey}</span>
+                  {catKey === suggestedCategory && (
+                    <span style={styles.catModalBadge}>SUGGESTED</span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {expanded && (
         <div style={styles.researchCardDetails}>
@@ -4661,6 +4693,70 @@ function LoginScreen({ onLogin, theme = 'light' }) {
 // DATABASE VIEW — admin tool to inspect / clear / load KV tables
 // ============================================================================
 
+// Smart mapping section — hides itself if all required fields auto-mapped
+function ExcelMappingSection({ target, requiredFields, optionalFields, mapping, setMapping, headers, requiredMapped, detectedFields }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Compact success view when all required fields auto-mapped
+  if (requiredMapped && !expanded) {
+    return (
+      <div style={styles.excelMappingCompact}>
+        <div style={styles.excelMappingCompactMain}>
+          <Check size={14} style={{ color: 'var(--c-green)', flexShrink: 0 }} />
+          <div style={styles.excelMappingCompactText}>
+            <strong>Auto-detected {detectedFields.length} column{detectedFields.length !== 1 ? 's' : ''}:</strong>{' '}
+            {detectedFields.map(f => (
+              <span key={f} style={styles.excelMappingCompactPill}>
+                {f} ← {mapping[f]}
+              </span>
+            ))}
+          </div>
+        </div>
+        <button style={styles.excelMappingAdjustBtn} onClick={() => setExpanded(true)}>
+          Adjust mapping
+        </button>
+      </div>
+    );
+  }
+
+  // Full mapping UI if required missing OR user chose to adjust
+  return (
+    <div style={styles.excelMappingSection}>
+      <div style={styles.excelMappingTitle}>
+        Column mapping
+        {expanded && (
+          <button style={styles.excelMappingAdjustBtn} onClick={() => setExpanded(false)}>
+            Collapse
+          </button>
+        )}
+      </div>
+      <div style={styles.excelMappingHint}>
+        {requiredMapped
+          ? 'Adjust the auto-detected mappings if needed.'
+          : `Title column not detected — please pick it manually. Required fields are marked *.`}
+      </div>
+      <div style={styles.excelMappingGrid}>
+        {optionalFields.map(field => (
+          <div key={field} style={styles.excelMappingRow}>
+            <div style={styles.excelMappingField}>
+              {field}
+              {requiredFields.includes(field) && <span style={styles.excelMappingRequired}> *</span>}
+            </div>
+            <select
+              value={mapping[field] || ''}
+              onChange={e => setMapping(m => ({ ...m, [field]: e.target.value }))}
+              style={styles.excelMappingSelect}
+            >
+              <option value="">— skip —</option>
+              {headers.map(h => <option key={h} value={h}>{h}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ============================================================================
 // EXCEL UPLOADER — parse xlsx/csv files and load rows into topics or sitemap
 // ============================================================================
@@ -4701,14 +4797,14 @@ function ExcelUploader({ showToast, onDone }) {
 
   const autoMap = (cols) => {
     return {
-      title: guessColumn(cols, ['title', 'workingtitle', 'name', 'topic', 'article']),
-      keyword: guessColumn(cols, ['keyword', 'primarykeyword', 'seo', 'searchterm']),
-      cluster: guessColumn(cols, ['cluster', 'subsection', 'pillar', 'subcategory', 'topic']),
-      category: guessColumn(cols, ['category', 'section', 'mainmenu', 'hub']),
-      url: guessColumn(cols, ['url', 'slug', 'urlslug', 'link']),
-      angle: guessColumn(cols, ['angle', 'brief', 'description']),
-      whyEvergreen: guessColumn(cols, ['whyevergreen', 'why', 'rationale']),
-      whyNow: guessColumn(cols, ['whynow', 'timeliness']),
+      title: guessColumn(cols, ['workingtitle', 'articletitle', 'title', 'headline', 'topic', 'articlename', 'article', 'name']),
+      keyword: guessColumn(cols, ['primarykeyword', 'seokeyword', 'keyword', 'seokw', 'seo', 'searchterm', 'kw']),
+      cluster: guessColumn(cols, ['cluster', 'subsection', 'subcategory', 'pillar', 'subhub', 'topiccluster', 'grouping']),
+      category: guessColumn(cols, ['category', 'mainmenu', 'section', 'hub', 'mainsection', 'menu', 'topcategory']),
+      url: guessColumn(cols, ['url', 'urlslug', 'slug', 'link', 'permalink']),
+      angle: guessColumn(cols, ['notesangle', 'angle', 'notes', 'brief', 'description', 'summary', 'take', 'noteangle']),
+      whyEvergreen: guessColumn(cols, ['whyevergreen', 'why', 'rationale', 'reason']),
+      whyNow: guessColumn(cols, ['whynow', 'timeliness', 'newshook']),
     };
   };
 
@@ -4928,31 +5024,25 @@ function ExcelUploader({ showToast, onDone }) {
             </div>
           </div>
 
-          {/* Column mapping */}
-          <div style={styles.excelMappingSection}>
-            <div style={styles.excelMappingTitle}>Column mapping</div>
-            <div style={styles.excelMappingHint}>
-              Map your Excel columns to the topic fields. Title is required. Others are optional but recommended.
-            </div>
-            <div style={styles.excelMappingGrid}>
-              {OPTIONAL_FIELDS[target].map(field => (
-                <div key={field} style={styles.excelMappingRow}>
-                  <div style={styles.excelMappingField}>
-                    {field}
-                    {REQUIRED_FIELDS[target].includes(field) && <span style={styles.excelMappingRequired}> *</span>}
-                  </div>
-                  <select
-                    value={mapping[field] || ''}
-                    onChange={e => setMapping(m => ({ ...m, [field]: e.target.value }))}
-                    style={styles.excelMappingSelect}
-                  >
-                    <option value="">— skip —</option>
-                    {headers.map(h => <option key={h} value={h}>{h}</option>)}
-                  </select>
-                </div>
-              ))}
-            </div>
-          </div>
+          {/* Column mapping — collapsed by default if title auto-detected */}
+          {(() => {
+            const [showMapping, setShowMapping] = [false, () => {}]; // fallback if not needed
+            const requiredMapped = REQUIRED_FIELDS[target].every(f => mapping[f]);
+            const detectedFields = Object.entries(mapping).filter(([, v]) => v).map(([k]) => k);
+
+            return (
+              <ExcelMappingSection
+                target={target}
+                requiredFields={REQUIRED_FIELDS[target]}
+                optionalFields={OPTIONAL_FIELDS[target]}
+                mapping={mapping}
+                setMapping={setMapping}
+                headers={headers}
+                requiredMapped={requiredMapped}
+                detectedFields={detectedFields}
+              />
+            );
+          })()}
 
           {/* Defaults */}
           <div style={styles.excelRow}>
@@ -7488,6 +7578,108 @@ const styles = {
     borderColor: colors.green, background: colors.bg, color: colors.ink, fontWeight: 600,
   },
   settingsTabHelp: { fontSize: 10.5, color: colors.faint, fontWeight: 400 },
+
+  // === EXCEL COMPACT MAPPING ===
+  excelMappingCompact: {
+    padding: '10px 12px', background: 'rgba(45, 95, 78, 0.06)',
+    border: `1px solid ${colors.green}`, borderRadius: 5,
+    marginBottom: 12, display: 'flex', alignItems: 'center',
+    gap: 12, flexWrap: 'wrap',
+  },
+  excelMappingCompactMain: { display: 'flex', alignItems: 'flex-start', gap: 8, flex: 1, minWidth: 0 },
+  excelMappingCompactText: { fontSize: 12, color: colors.ink, lineHeight: 1.5 },
+  excelMappingCompactPill: {
+    display: 'inline-block', padding: '2px 6px', margin: '2px 4px 2px 0',
+    background: colors.surface, border: `1px solid ${colors.borderSoft}`,
+    borderRadius: 3, fontSize: 11, fontFamily: 'ui-monospace, monospace',
+    color: colors.muted,
+  },
+  excelMappingAdjustBtn: {
+    background: 'transparent', border: 'none', color: colors.muted,
+    fontSize: 11.5, fontWeight: 600, cursor: 'pointer',
+    padding: '4px 8px', borderRadius: 3, fontFamily: fonts.body,
+    textDecoration: 'underline',
+  },
+
+  // === RESEARCH CARD ANGLE (visible by default) ===
+  researchCardAngle: {
+    display: 'flex', gap: 8, marginTop: 5,
+    fontSize: 12.5, color: colors.ink, lineHeight: 1.5,
+  },
+  researchCardAngleLabel: {
+    fontSize: 10, fontWeight: 700, textTransform: 'uppercase',
+    letterSpacing: '0.05em', color: colors.muted, whiteSpace: 'nowrap',
+    padding: '2px 6px', background: colors.bg, borderRadius: 3,
+    flexShrink: 0, height: 'fit-content', marginTop: 1,
+  },
+
+  // === CATEGORY PICKER MODAL (popup) ===
+  catModalBackdrop: {
+    position: 'fixed', inset: 0,
+    background: 'rgba(0, 0, 0, 0.5)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    zIndex: 200, padding: 20,
+  },
+  catModal: {
+    background: colors.surface,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 10,
+    maxWidth: 480, width: '100%',
+    maxHeight: '80vh',
+    display: 'flex', flexDirection: 'column',
+    boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+    overflow: 'hidden',
+  },
+  catModalHeader: {
+    display: 'flex', gap: 12, alignItems: 'flex-start',
+    padding: '18px 20px 14px',
+    borderBottom: `1px solid ${colors.borderSoft}`,
+  },
+  catModalEyebrow: {
+    fontSize: 10.5, fontWeight: 700, letterSpacing: '0.08em',
+    textTransform: 'uppercase', color: colors.muted, marginBottom: 4,
+  },
+  catModalTitle: {
+    fontFamily: fonts.display, fontSize: 20, fontWeight: 600,
+    color: colors.ink, marginBottom: 6,
+  },
+  catModalTopic: {
+    fontSize: 12.5, color: colors.muted, fontStyle: 'italic', lineHeight: 1.4,
+  },
+  catModalClose: {
+    background: 'transparent', border: 'none', color: colors.muted,
+    padding: 6, cursor: 'pointer', display: 'inline-flex', alignItems: 'center',
+    borderRadius: 4, flexShrink: 0,
+  },
+  catModalHint: {
+    padding: '10px 20px', fontSize: 12,
+    background: 'rgba(45, 95, 78, 0.08)',
+    color: colors.ink, borderBottom: `1px solid ${colors.borderSoft}`,
+  },
+  catModalList: {
+    overflowY: 'auto', flex: 1,
+    display: 'flex', flexDirection: 'column',
+    padding: 8,
+  },
+  catModalItem: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    width: '100%', padding: '12px 14px',
+    background: 'transparent', border: `1px solid transparent`,
+    borderRadius: 6, marginBottom: 2,
+    fontFamily: fonts.body, fontSize: 14, color: colors.ink,
+    textAlign: 'left', cursor: 'pointer',
+    transition: 'background 0.15s',
+  },
+  catModalItemSuggested: {
+    background: 'rgba(45, 95, 78, 0.08)',
+    borderColor: colors.green,
+    fontWeight: 600,
+  },
+  catModalBadge: {
+    fontSize: 9.5, fontWeight: 700, letterSpacing: '0.06em',
+    background: colors.green, color: '#fff',
+    padding: '3px 8px', borderRadius: 3,
+  },
 
   // === CATEGORY PICKER (in research card) ===
   categoryPicker: {
