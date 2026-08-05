@@ -4875,33 +4875,82 @@ function ExcelUploader({ showToast, onDone }) {
   };
 
   const buildItems = () => {
-    const uid = () => `${target === 'topics' ? 'tp' : 'sp'}_${Math.random().toString(36).slice(2, 12)}_${Date.now().toString(36)}`;
+    const makeId = (prefix) => `${prefix}_${Math.random().toString(36).slice(2, 12)}_${Date.now().toString(36)}_${Math.floor(Math.random() * 1000)}`;
     const now = Date.now();
-    return rows.map(row => {
-      const item = {
-        id: uid(),
-        addedAt: now,
-        createdAt: now,
+
+    if (target === 'topics') {
+      // Just build topics
+      return {
+        topics: rows.map(row => {
+          const item = { id: makeId('tp'), addedAt: now, createdAt: now };
+          Object.entries(mapping).forEach(([field, col]) => {
+            if (col && row[col] !== undefined && row[col] !== '') {
+              item[field] = String(row[col]).trim();
+            }
+          });
+          if (!item.category && defaultCategory) item.category = defaultCategory;
+          if (!item.cluster && defaultCluster) item.cluster = defaultCluster;
+          if (item.category) item.category = normalizeCategory(item.category);
+          item.type = contentType;
+          item.status = 'pending';
+          item.source = 'excel_upload';
+          return item;
+        }).filter(item => item.title),
+        sitePages: [],
       };
-      // Copy mapped fields
+    }
+
+    // target === 'sitePages' — build BOTH sitemap pages AND matching evergreen topics
+    const sitePages = [];
+    const topics = [];
+    rows.forEach(row => {
+      const shared = {};
       Object.entries(mapping).forEach(([field, col]) => {
         if (col && row[col] !== undefined && row[col] !== '') {
-          item[field] = String(row[col]).trim();
+          shared[field] = String(row[col]).trim();
         }
       });
-      // Apply defaults
-      if (!item.category && defaultCategory) item.category = defaultCategory;
-      if (!item.cluster && defaultCluster) item.cluster = defaultCluster;
-      // Normalize category
-      if (item.category) item.category = normalizeCategory(item.category);
-      // Type-specific fields
-      if (target === 'topics') {
-        item.type = contentType;
-        item.status = 'pending';
-        item.source = 'excel_upload';
-      }
-      return item;
-    }).filter(item => item.title);
+      if (!shared.title) return;
+      if (!shared.category && defaultCategory) shared.category = defaultCategory;
+      if (!shared.cluster && defaultCluster) shared.cluster = defaultCluster;
+      if (shared.category) shared.category = normalizeCategory(shared.category);
+
+      const topicId = makeId('tp');
+      const pageId = makeId('sp');
+
+      // Sitemap page
+      sitePages.push({
+        id: pageId,
+        title: shared.title,
+        url: shared.url || '',
+        keyword: shared.keyword || '',
+        cluster: shared.cluster || 'Unclustered',
+        category: shared.category || '',
+        type: 'evergreen',
+        addedAt: now,
+        fromSitemapUpload: true,
+        sourceTopicId: topicId,
+      });
+
+      // Matching evergreen topic ready for writing
+      topics.push({
+        id: topicId,
+        title: shared.title,
+        keyword: shared.keyword || '',
+        cluster: shared.cluster || 'Unclustered',
+        category: shared.category || '',
+        angle: shared.angle || `Comprehensive evergreen guide for "${shared.title}". Anchor article aiming for topical authority in the ${shared.cluster || 'topic'} cluster.`,
+        whyEvergreen: shared.whyEvergreen || `Part of the ${shared.cluster || 'evergreen'} cluster building long-term topical authority.`,
+        type: 'evergreen',
+        status: 'pending',
+        source: 'sitemap_upload',
+        addedAt: now,
+        createdAt: now,
+        sourceSitemapId: pageId,
+      });
+    });
+
+    return { sitePages, topics };
   };
 
   const doUpload = async () => {
@@ -4909,31 +4958,79 @@ function ExcelUploader({ showToast, onDone }) {
       showToast('Please map the Title column', 'error');
       return;
     }
-    const newItems = buildItems();
-    if (newItems.length === 0) {
+    const built = buildItems();
+    const totalCount = (built.topics?.length || 0) + (built.sitePages?.length || 0);
+    if (totalCount === 0) {
       showToast('No rows have a title — check your mapping', 'error');
       return;
     }
-    if (!confirm(`Upload ${newItems.length} ${target === 'topics' ? 'topics' : 'sitemap pages'}?\n\nMode: ${mode === 'replace' ? 'REPLACE all existing' : 'APPEND to existing'}`)) return;
+
+    // Build confirmation message
+    let confirmMsg;
+    if (target === 'topics') {
+      confirmMsg = `Upload ${built.topics.length} ${contentType} topics?\n\nMode: ${mode === 'replace' ? 'REPLACE all existing' : 'APPEND to existing'}`;
+    } else {
+      confirmMsg = `Upload ${built.sitePages.length} sitemap pages?\n\nEach page will ALSO create a matching evergreen topic in the pipeline, ready for writing.\n\nMode: ${mode === 'replace' ? 'REPLACE all existing sitemap + evergreen topics' : 'APPEND to existing'}`;
+    }
+    if (!confirm(confirmMsg)) return;
 
     setLoading(true);
     try {
-      let finalValue;
-      if (mode === 'replace') {
-        finalValue = newItems;
+      if (target === 'topics') {
+        // Just topics table
+        let finalValue;
+        if (mode === 'replace') {
+          finalValue = built.topics;
+        } else {
+          const cur = await fetch('/api/data/topics', { credentials: 'same-origin' }).then(r => r.json());
+          finalValue = [...built.topics, ...(cur.value || [])];
+        }
+        const res = await fetch('/api/data/topics', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ value: finalValue }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+        showToast(`Loaded ${built.topics.length} topics — reloading…`, 'success');
       } else {
-        const cur = await fetch('/api/data/' + target, { credentials: 'same-origin' }).then(r => r.json());
-        finalValue = [...newItems, ...(cur.value || [])];
+        // Both sitemap + topics
+        let finalSitePages, finalTopics;
+        if (mode === 'replace') {
+          finalSitePages = built.sitePages;
+          // For replace mode: keep news/mythbust topics, replace only evergreen
+          const curTopics = await fetch('/api/data/topics', { credentials: 'same-origin' }).then(r => r.json());
+          const nonEvergreen = (curTopics.value || []).filter(t => t.type !== 'evergreen');
+          finalTopics = [...built.topics, ...nonEvergreen];
+        } else {
+          const [curSP, curTopics] = await Promise.all([
+            fetch('/api/data/sitePages', { credentials: 'same-origin' }).then(r => r.json()),
+            fetch('/api/data/topics', { credentials: 'same-origin' }).then(r => r.json()),
+          ]);
+          finalSitePages = [...built.sitePages, ...(curSP.value || [])];
+          finalTopics = [...built.topics, ...(curTopics.value || [])];
+        }
+
+        // Write both in parallel
+        const [spRes, topRes] = await Promise.all([
+          fetch('/api/data/sitePages', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ value: finalSitePages }),
+          }),
+          fetch('/api/data/topics', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ value: finalTopics }),
+          }),
+        ]);
+        if (!spRes.ok) throw new Error(`Sitemap save failed: HTTP ${spRes.status}`);
+        if (!topRes.ok) throw new Error(`Topics save failed: HTTP ${topRes.status}`);
+        showToast(`Loaded ${built.sitePages.length} pages + ${built.topics.length} evergreen topics — reloading…`, 'success');
       }
-      const res = await fetch('/api/data/' + target, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ value: finalValue }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-      showToast(`Loaded ${newItems.length} ${target === 'topics' ? 'topics' : 'pages'} — reloading…`, 'success');
-      setTimeout(() => window.location.reload(), 1200);
+      setTimeout(() => window.location.reload(), 1500);
     } catch (e) {
       showToast(`Upload failed: ${e.message}`, 'error');
     }
@@ -4952,7 +5049,7 @@ function ExcelUploader({ showToast, onDone }) {
     <section style={styles.dbSection}>
       <h2 style={styles.dbSectionTitle}>Upload Excel or CSV</h2>
       <p style={styles.dbSectionSub}>
-        Upload .xlsx or .csv files to bulk-load topics or sitemap pages. Columns auto-map from common headers (Title, Keyword, Cluster, Category, URL, Angle). Adjust the mapping if needed.
+        Upload .xlsx or .csv files to bulk-load topics or sitemap pages. Columns auto-map from common headers (Title, Working title, Keyword, Cluster, Category, URL, Angle, Notes). <strong>Uploading to Sitemap also creates matching evergreen topics in the pipeline, ready for approval and writing.</strong>
       </p>
 
       {/* File picker */}
@@ -5098,7 +5195,7 @@ function ExcelUploader({ showToast, onDone }) {
             disabled={loading || !mapping.title}
           >
             {loading ? <Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <Download size={13} />}
-            {mode === 'replace' ? 'Replace with' : 'Upload'} {rows.length} {target === 'topics' ? 'topics' : 'pages'}
+            {mode === 'replace' ? 'Replace with' : 'Upload'} {rows.length} {target === 'topics' ? 'topics' : 'pages + evergreen topics'}
           </button>
         </>
       )}
