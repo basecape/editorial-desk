@@ -12,8 +12,8 @@ export const maxDuration = 300;
 
 const LOCK_KEY = 'writeWorkerLock';
 const LOCK_TTL_SECONDS = 300;         // 5 minutes
-const MAX_TOPICS_PER_RUN = 3;         // Process up to 3 topics per invocation
-const SAFETY_BUDGET_MS = 60 * 1000;   // Stop starting new topics if <60s function budget left
+const MAX_TOPICS_PER_RUN = 1;         // Process 1 topic per invocation (self-triggers next one)
+const SAFETY_BUDGET_MS = 30 * 1000;   // Stop starting new topics if <30s function budget left
 
 async function acquireLock() {
   // SET LOCK_KEY <ts> NX EX 300 — only succeeds if key doesn't exist

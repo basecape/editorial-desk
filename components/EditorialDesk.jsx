@@ -3550,6 +3550,180 @@ function ErrorPanel({ message, onClose }) {
   );
 }
 
+// ============================================================================
+// AI REWRITE PANEL — instruct Claude to rewrite the current draft body
+// ============================================================================
+
+function AiRewritePanel({ draft, currentContent, onRewritten, showToast }) {
+  const [instructions, setInstructions] = useState('');
+  const [collapsed, setCollapsed] = useState(true);
+  const [rewriting, setRewriting] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+
+  // Tick every second while rewriting
+  useEffect(() => {
+    if (!rewriting) return;
+    const t = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [rewriting]);
+
+  const PRESETS = [
+    { label: 'Shorter', text: 'Cut the length by about 30% while keeping every important point. Remove filler, tighten sentences.' },
+    { label: 'Longer', text: 'Expand by 30–50% with concrete examples, sub-headings, and additional practical detail. No fluff.' },
+    { label: 'More SA context', text: 'Add specific South African context throughout — SA health authorities, local statistics, SA prices in Rand, SA foods, medical aid considerations.' },
+    { label: 'More casual', text: 'Rewrite in a more conversational, warmer tone. Contractions OK. Talk to the reader like a friend.' },
+    { label: 'More authoritative', text: 'Rewrite in a more authoritative, evidence-forward tone. Add citations to studies with year and journal.' },
+    { label: 'Add takeaways', text: 'Add a clear "Bottom line" or "Key takeaways" section at the end with 3–5 concrete bullet points.' },
+    { label: 'Better headings', text: 'Improve the H2 and H3 subheadings — make them clearer, more scannable, and reader-focused.' },
+  ];
+
+  const buildRewritePrompt = () => {
+    return `You are rewriting an existing article based on the editor's instructions. Return ONLY the rewritten article body in markdown — no preamble, no metadata block, no code fences.
+
+ARTICLE CONTEXT:
+- Title: ${draft.title}
+- Type: ${draft.type}
+- Category: ${draft.category}
+- Cluster: ${draft.cluster || 'n/a'}
+- Primary keyword: ${draft.keyword || 'n/a'}
+- Meta description: ${draft.meta || 'n/a'}
+
+EDITOR'S REWRITE INSTRUCTIONS:
+${instructions}
+
+CURRENT ARTICLE BODY:
+${currentContent}
+
+Rewrite the article body to address the editor's instructions. Keep the same core information unless the instructions specifically ask you to change what's covered. Keep the # H1 headline at the start. Output only the markdown body — no TITLE:/META:/EXCERPT: lines, no --- separator, no wrapper.`;
+  };
+
+  const doRewrite = async () => {
+    if (!instructions.trim()) {
+      showToast('Enter instructions first', 'error');
+      return;
+    }
+    if (!confirm(`Rewrite the article with these instructions?\n\n"${instructions.slice(0, 200)}${instructions.length > 200 ? '…' : ''}"\n\nThe current body will be replaced. Save the current version first if you want a backup (Copy markdown).`)) return;
+
+    setRewriting(true);
+    setElapsed(0);
+    try {
+      const res = await fetch('/api/claude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 8000,
+          stream: false,
+          messages: [{ role: 'user', content: buildRewritePrompt() }],
+        }),
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}${txt ? `: ${txt.slice(0, 200)}` : ''}`);
+      }
+      const data = await res.json();
+      const textBlocks = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n\n');
+      if (!textBlocks || textBlocks.length < 100) {
+        throw new Error(`Response too short (${textBlocks?.length || 0} chars)`);
+      }
+      // Strip any accidental markdown fence
+      const cleaned = textBlocks
+        .replace(/^```(?:markdown|md)?\n/, '')
+        .replace(/\n```\s*$/, '')
+        .trim();
+      onRewritten(cleaned);
+      setInstructions('');
+      setCollapsed(true);
+    } catch (e) {
+      showToast(`Rewrite failed: ${e.message.slice(0, 100)}`, 'error');
+    }
+    setRewriting(false);
+  };
+
+  const ESTIMATED_SECONDS = 60;
+  const pct = Math.min(95, Math.round((elapsed / ESTIMATED_SECONDS) * 100));
+
+  if (collapsed) {
+    return (
+      <button style={styles.aiRewriteCollapsed} onClick={() => setCollapsed(false)}>
+        <Sparkles size={13} />
+        <span>Rewrite with AI</span>
+        <span style={styles.aiRewriteHint}>Tell Claude how to change this article</span>
+      </button>
+    );
+  }
+
+  return (
+    <div style={styles.aiRewritePanel}>
+      <div style={styles.aiRewriteHead}>
+        <div style={styles.aiRewriteHeadLeft}>
+          <Sparkles size={14} style={{ color: 'var(--c-green)' }} />
+          <span style={styles.aiRewriteTitle}>Rewrite with AI</span>
+        </div>
+        <button style={styles.iconBtnSm} onClick={() => setCollapsed(true)}><X size={13} /></button>
+      </div>
+
+      {/* Preset chips */}
+      <div style={styles.aiRewritePresets}>
+        {PRESETS.map(p => (
+          <button
+            key={p.label}
+            style={styles.aiRewritePreset}
+            onClick={() => setInstructions(prev => prev ? `${prev}\n\n${p.text}` : p.text)}
+            disabled={rewriting}
+            title={p.text}
+          >
+            + {p.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Instructions */}
+      <label style={styles.formLabel}>Instructions for the rewrite</label>
+      <textarea
+        value={instructions}
+        onChange={e => setInstructions(e.target.value)}
+        placeholder="e.g. Make this more focused on women in their 30s. Add a section on medical aid coverage. Cut the intro. Add 2–3 SA statistics from SAMRC."
+        style={styles.aiRewriteTextarea}
+        rows={5}
+        disabled={rewriting}
+      />
+
+      {/* Rewriting progress */}
+      {rewriting && (
+        <div style={styles.aiRewriteProgress}>
+          <div style={styles.aiRewriteProgressBar}>
+            <div style={{ ...styles.aiRewriteProgressFill, width: `${pct}%` }} />
+          </div>
+          <div style={styles.aiRewriteProgressMeta}>
+            <span style={{ color: 'var(--c-green)', fontWeight: 700 }}>{pct}%</span>
+            <span>{elapsed}s elapsed · Claude is rewriting</span>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+        <button
+          style={styles.primaryBtn}
+          onClick={doRewrite}
+          disabled={rewriting || !instructions.trim()}
+        >
+          {rewriting
+            ? <><Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} /> Rewriting…</>
+            : <><Sparkles size={13} /> Rewrite article</>
+          }
+        </button>
+        {instructions && !rewriting && (
+          <button style={styles.secondaryBtn} onClick={() => setInstructions('')}>
+            Clear
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function DraftView({ draft, fromLibrary, onSave, onLearnFromEdits, onPublish, onExport, onClose, showToast }) {
   const [content, setContent] = useState(draft.content);
   const [editing, setEditing] = useState(false);
@@ -3732,6 +3906,19 @@ function DraftView({ draft, fromLibrary, onSave, onLearnFromEdits, onPublish, on
         </div>
       ) : (
         <>
+          {/* AI REWRITE PANEL — visible in edit mode for both drafts and library items */}
+          {editing && (
+            <AiRewritePanel
+              draft={draft}
+              currentContent={content}
+              onRewritten={(newContent) => {
+                setContent(newContent);
+                showToast('Rewrite applied — review and save', 'success');
+              }}
+              showToast={showToast}
+            />
+          )}
+
           {editing ? (
             <textarea value={content} onChange={e => setContent(e.target.value)} style={styles.draftEditor} rows={24} />
           ) : (
@@ -7718,6 +7905,66 @@ const styles = {
     letterSpacing: '0.05em', color: colors.muted, whiteSpace: 'nowrap',
     padding: '2px 6px', background: colors.bg, borderRadius: 3,
     flexShrink: 0, height: 'fit-content', marginTop: 1,
+  },
+
+  // === AI REWRITE PANEL ===
+  aiRewriteCollapsed: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    padding: '10px 14px', width: '100%',
+    background: colors.bg, border: `1px dashed ${colors.borderSoft}`,
+    borderRadius: 6, marginBottom: 10, cursor: 'pointer',
+    fontFamily: fonts.body, fontSize: 12.5, color: colors.ink,
+    fontWeight: 600, textAlign: 'left',
+  },
+  aiRewriteHint: {
+    fontSize: 11.5, color: colors.muted, fontWeight: 400,
+    marginLeft: 4, fontStyle: 'italic',
+  },
+  aiRewritePanel: {
+    background: colors.surface, border: `1px solid ${colors.green}`,
+    borderLeftWidth: 3, borderRadius: 6,
+    padding: 14, marginBottom: 12,
+  },
+  aiRewriteHead: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    gap: 8, marginBottom: 10,
+  },
+  aiRewriteHeadLeft: { display: 'flex', alignItems: 'center', gap: 6 },
+  aiRewriteTitle: {
+    fontSize: 13, fontWeight: 700, letterSpacing: '-0.005em', color: colors.ink,
+  },
+  aiRewritePresets: {
+    display: 'flex', gap: 5, flexWrap: 'wrap', marginBottom: 10,
+  },
+  aiRewritePreset: {
+    padding: '4px 9px', fontSize: 11, fontWeight: 500,
+    background: colors.bg, color: colors.muted,
+    border: `1px solid ${colors.border}`, borderRadius: 4,
+    fontFamily: fonts.body, cursor: 'pointer',
+  },
+  aiRewriteTextarea: {
+    width: '100%', boxSizing: 'border-box',
+    padding: '10px 12px', fontSize: 13, lineHeight: 1.5,
+    background: colors.inputBg, color: colors.ink,
+    border: `1px solid ${colors.border}`, borderRadius: 5,
+    fontFamily: fonts.body, resize: 'vertical',
+  },
+  aiRewriteProgress: {
+    marginTop: 10, padding: '8px 10px',
+    background: 'rgba(45, 95, 78, 0.08)',
+    border: `1px solid ${colors.green}`, borderRadius: 5,
+  },
+  aiRewriteProgressBar: {
+    width: '100%', height: 4, background: colors.borderSoft,
+    borderRadius: 2, overflow: 'hidden', marginBottom: 5,
+  },
+  aiRewriteProgressFill: {
+    height: '100%', background: colors.green,
+    borderRadius: 2, transition: 'width 0.6s ease-out',
+  },
+  aiRewriteProgressMeta: {
+    display: 'flex', gap: 10, fontSize: 11.5, color: colors.muted,
+    fontFamily: 'ui-monospace, monospace',
   },
 
   // === PUBLISH CATEGORY PICKER ===
